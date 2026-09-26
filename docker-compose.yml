@@ -1,0 +1,28 @@
+services:
+  master:
+    build: ./master
+    container_name: master
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+    networks:
+      - energyshark
+
+  connector:
+    build: ./connector
+    container_name: connector
+    restart: unless-stopped
+    env_file:
+      - ./connector/.env
+    environment:
+      MASTER_URL: http://master:3000/events
+    depends_on:
+      - master
+    networks:
+      - energyshark
+
+networks:
+  energyshark:
+    driver: bridge

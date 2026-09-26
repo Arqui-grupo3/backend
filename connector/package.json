@@ -1,0 +1,14 @@
+{
+  "name": "energyshark-connector-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Prueba de concepto: conexion al broker RabbitMQ de EnergyShark (IIC2173, Entrega 0)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4",
+    "dotenv": "^16.4.5"
+  }
+}
