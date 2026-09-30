@@ -3,3 +3,7 @@ node_modules/
 *.pem
 *.sql
 *.tar.gz
+*:Zone.Identifier
+Thumbs.db
+desktop.ini
+.DS_Store
