@@ -1,0 +1,97 @@
+name: Deploy a producción
+
+# Se dispara solo con push a main. Las ramas de trabajo no despliegan nada.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:      # permite lanzarlo a mano desde la pestaña Actions
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REGISTRY: 088674918891.dkr.ecr.us-east-2.amazonaws.com
+
+jobs:
+  build-and-push:
+    name: Construir y publicar imágenes en ECR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Cada imagen se publica con dos etiquetas: latest, que es la que el
+      # compose de producción usa, y el SHA del commit, que permite saber
+      # exactamente qué versión está corriendo y volver atrás si hace falta.
+      - name: Construir y publicar master
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/energyshark/master:latest \
+            -t $ECR_REGISTRY/energyshark/master:${{ github.sha }} \
+            ./master
+          docker push $ECR_REGISTRY/energyshark/master:latest
+          docker push $ECR_REGISTRY/energyshark/master:${{ github.sha }}
+
+      - name: Construir y publicar connector
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/energyshark/connector:latest \
+            -t $ECR_REGISTRY/energyshark/connector:${{ github.sha }} \
+            ./connector
+          docker push $ECR_REGISTRY/energyshark/connector:latest
+          docker push $ECR_REGISTRY/energyshark/connector:${{ github.sha }}
+
+  deploy:
+    name: Desplegar en la EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar la llave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      # El compose de producción viaja del repo al servidor en cada deploy,
+      # así la máquina nunca queda con una versión distinta a la del repo.
+      - name: Copiar el compose de producción
+        run: |
+          scp -i ~/.ssh/deploy_key docker-compose.prod.yml \
+            ubuntu@${{ secrets.EC2_HOST }}:~/energyshark/docker-compose.prod.yml
+
+      - name: Pull y levantar
+        run: |
+          ssh -i ~/.ssh/deploy_key ubuntu@${{ secrets.EC2_HOST }} bash -s <<'REMOTE'
+            set -euo pipefail
+            cd ~/energyshark
+
+            # La EC2 no tiene credenciales guardadas: obtiene un token de ECR
+            # de 12 horas a través del rol de instancia ec2-ecr-pull.
+            aws ecr get-login-password --region us-east-2 \
+              | sudo docker login --username AWS --password-stdin \
+                  088674918891.dkr.ecr.us-east-2.amazonaws.com
+
+            sudo docker compose -f docker-compose.prod.yml pull master connector
+            sudo docker compose -f docker-compose.prod.yml up -d
+            sudo docker compose -f docker-compose.prod.yml ps
+          REMOTE
+
+      - name: Verificar que la API responde
+        run: |
+          sleep 10
+          ssh -i ~/.ssh/deploy_key ubuntu@${{ secrets.EC2_HOST }} \
+            'curl -fsS http://localhost:3000/health'
