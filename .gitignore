@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 node_modules/
 .env
 *.pem
@@ -7,3 +8,14 @@ node_modules/
 Thumbs.db
 desktop.ini
 .DS_Store*:Zone.Identifier
+=======
+node_modules/
+.env
+*.pem
+*.sql
+*.tar.gz
+*:Zone.Identifier
+Thumbs.db
+desktop.ini
+.DS_Store
+>>>>>>> Creacion publisher, validacion de datos y desarrollo de nack, ack y error

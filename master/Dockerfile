@@ -1,6 +1,5 @@
 FROM node:20-alpine
 
-# curl para el HEALTHCHECK (RNF7)
 RUN apk add --no-cache curl
 
 WORKDIR /app
