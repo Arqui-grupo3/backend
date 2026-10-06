@@ -1,0 +1,70 @@
+# Compose de PRODUCCIÓN: consume las imágenes publicadas en ECR.
+#
+# El docker-compose.yml de la raíz sigue usando `build:` y es el que se usa
+# en local — así cualquiera del equipo puede levantar el stack con
+# `docker compose up --build` sin necesitar credenciales de AWS.
+#
+# En el servidor se usa este, y lo copia el workflow de deploy en cada push
+# a main. No editar este archivo directamente en la EC2: el siguiente deploy
+# lo sobrescribe.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-energyshark}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-energyshark}
+      POSTGRES_DB: ${POSTGRES_DB:-energyshark}
+    volumes:
+      # Las 83.000+ filas del ledger viven acá. Nunca correr `down -v`.
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-energyshark} -d ${POSTGRES_DB:-energyshark}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - energyshark
+
+  master:
+    image: 088674918891.dkr.ecr.us-east-2.amazonaws.com/energyshark/master:latest
+    container_name: master
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-energyshark}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-energyshark}
+      PGDATABASE: ${POSTGRES_DB:-energyshark}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - energyshark
+
+  connector:
+    image: 088674918891.dkr.ecr.us-east-2.amazonaws.com/energyshark/connector:latest
+    container_name: connector
+    restart: unless-stopped
+    # Credenciales de city.REE. Este archivo vive solo en el servidor y
+    # nunca entra al repositorio.
+    env_file:
+      - ./connector/.env
+    environment:
+      MASTER_URL: http://master:3000/events
+    depends_on:
+      - master
+    networks:
+      - energyshark
+
+networks:
+  energyshark:
+    driver: bridge
+
+volumes:
+  db_data:
