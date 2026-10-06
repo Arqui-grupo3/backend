@@ -1,5 +1,8 @@
 require('dotenv').config();
 const amqp = require('amqplib');
+const { createPublisher } = require('./publisher');
+const { validateEnvelope } = require('./validation');
+const RESPONSE_TYPES = new Set(['ack', 'nack', 'error']);
 
 const {
   RABBIT_URL,
@@ -21,7 +24,7 @@ if (!RABBIT_URL && (!RABBIT_USER || !RABBIT_PASS)) {
 }
 
 if (!RABBIT_QUEUE) {
-  console.error('Falta RABBIT_QUEUE (ej: observer.46.q) en tu .env.');
+  console.error('Falta RABBIT_QUEUE (ej: city.REE.q) en tu .env.');
   process.exit(1);
 }
 
@@ -47,10 +50,7 @@ async function main() {
   let connection;
   try {
     connection = await amqp.connect(url, {
-      // Si el handshake TLS falla por el certificado del broker, puedes
-      // descomentar la siguiente linea SOLO para pruebas locales.
-      // Nunca la dejes asi en producción / en la entrega final.
-      // rejectUnauthorized: false,
+      rejectUnauthorized: true,
     });
   } catch (err) {
     console.error('[connector] Error al conectar:', err.message);
@@ -70,6 +70,7 @@ async function main() {
 
   const channel = await connection.createChannel();
   await channel.prefetch(1);
+  const publishMessage = await createPublisher(connection);
 
   console.log(`[connector] Escuchando la cola "${RABBIT_QUEUE}"...`);
 
@@ -77,6 +78,14 @@ async function main() {
     RABBIT_QUEUE,
     async (msg) => {
       if (msg === null) return;
+
+      const routingKey = msg.fields?.routingKey;
+      if (!['city.REE', 'city.broadcast'].includes(routingKey)) {
+        console.error(`[connector] Routing key inesperada, se descarta: ${JSON.stringify(routingKey)}`);
+        channel.nack(msg, false, false);
+        return;
+      }
+      const delivery = routingKey === 'city.broadcast' ? 'broadcast' : 'direct';
 
       const receivedAt = new Date().toISOString();
 
@@ -90,13 +99,39 @@ async function main() {
         return;
       }
 
-      console.log(`[connector] Evento recibido idpk=${event.idpk} type=${event.type}`);
+      if (event === null || typeof event !== "object" || Array.isArray(event)) {
+        console.error("[connector] El mensaje no es un objeto JSON, se descarta.");
+        channel.nack(msg, false, false);
+        return;
+      }
+
+      if (!Object.hasOwn(event, "msgId")) {
+        console.error("[connector] El mensaje no incluye msgId, se descarta.");
+        channel.nack(msg, false, false);
+        return;
+      }
 
       try {
+        const invalid = validateEnvelope(event);
+        if (invalid) {
+          console.error(`[connector] Mensaje rechazado: ${invalid.reason} msgId=${JSON.stringify(event.msgId)}: ${invalid.message}`);
+          if (!RESPONSE_TYPES.has(event.type)) {
+            const data = { target: event.msgId, message: invalid.message };
+            if (Object.hasOwn(event, 'cycleId')) data.cycleId = event.cycleId;
+            await publishMessage({
+              type: 'nack', reason: invalid.reason, code: invalid.code, data,
+            });
+          }
+          channel.ack(msg);
+          return;
+        }
+
+        console.log(`[connector] Evento recibido idpk=${event.idpk} type=${event.type}`);
+
         const response = await fetch(MASTER_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...event, receivedAt }),
+          body: JSON.stringify({ ...event, receivedAt, routingKey, delivery }),
         });
 
         if (!response.ok) {
@@ -104,10 +139,14 @@ async function main() {
         }
 
         console.log(`[connector] Enviado a master OK (idpk=${event.idpk})`);
+        if (!RESPONSE_TYPES.has(event.type)) {
+          await publishMessage({ type: "ack", data: { target: event.msgId } });
+        }
+
         channel.ack(msg);
       } catch (err) {
 
-        console.error('[connector] No se pudo enviar a master, se reencola:', err.message);
+        console.error('[connector] No se pudo procesar el mensaje o publicar su respuesta, se reencola:', err.message);
 
         await sleep(MASTER_RETRY_DELAY_MS);
         channel.nack(msg, false, true);

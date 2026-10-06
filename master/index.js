@@ -20,7 +20,7 @@ app.post('/events', (req, res) => {
     return res.status(400).json({ error: 'Body invalido, se esperaba JSON' });
   }
 
-  const { idpk, type, packageBody, receivedAt } = body;
+  const { idpk, type, data, receivedAt } = body;
 
   if (!idpk || !type) {
     return res.status(400).json({ error: 'Faltan campos requeridos: idpk, type' });
@@ -35,7 +35,16 @@ app.post('/events', (req, res) => {
     id: randomUUID(),
     idpk,
     type,
-    packageBody: packageBody ?? null,
+    msgId: body.msgId,
+    timestamp: body.timestamp,
+    cycleId: body.cycleId,
+    sender: body.sender,
+    cityId: body.cityId,
+    reason: body.reason,
+    code: body.code,
+    data: data ?? null,
+    routingKey: body.routingKey,
+    delivery: body.delivery,
     receivedAt: receivedAt || new Date().toISOString(),
   };
 
