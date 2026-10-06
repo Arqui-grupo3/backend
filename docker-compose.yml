@@ -1,4 +1,22 @@
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-energyshark}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-energyshark}
+      POSTGRES_DB: ${POSTGRES_DB:-energyshark}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-energyshark} -d ${POSTGRES_DB:-energyshark}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - energyshark
+
   master:
     build: ./master
     container_name: master
@@ -7,6 +25,14 @@ services:
       - "3000:3000"
     environment:
       PORT: 3000
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-energyshark}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-energyshark}
+      PGDATABASE: ${POSTGRES_DB:-energyshark}
+    depends_on:
+      db:
+        condition: service_healthy
     networks:
       - energyshark
 
@@ -26,3 +52,6 @@ services:
 networks:
   energyshark:
     driver: bridge
+
+volumes:
+  db_data:
