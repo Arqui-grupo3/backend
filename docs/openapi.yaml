@@ -22,7 +22,7 @@ paths:
   /events:
     post:
       security: []
-      description: Endpoint interno usado por connector despues de persistir el mensaje recibido.
+      description: Endpoint interno usado por connector; confirma despues de persistir el mensaje y su aplicacion al ledger.
       requestBody:
         required: true
         content:
@@ -36,6 +36,8 @@ paths:
           description: idpk ya persistido; no se reaplica
         '400':
           description: Request invalida
+        '422':
+          description: Mensaje de ledger invalido; no se persiste
   /history:
     get:
       parameters:
@@ -90,6 +92,47 @@ paths:
                 $ref: '#/components/schemas/PaginatedCycles'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /cycles/{cycleId}/ledger:
+    get:
+      description: >-
+        Proyeccion de Fase 1 (status-statement y transfer recibidos), desde la
+        instalacion del ledger con base cero. No incluye demandas ni negociaciones.
+        budgetBalance es el saldo global observado en asOfSequence, no un saldo
+        de cierre; energyBalance es propio del ciclo. Importes decimales como strings.
+      parameters:
+        - in: path
+          name: cycleId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Estado reconstruido desde operaciones inmutables
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cycleId, initialized, budgetBalance, energyBalance, asOfSequence, scope, historicalBaseline]
+                properties:
+                  cycleId: { type: string }
+                  initialized: { type: boolean }
+                  budgetBalance: { type: string, example: '500.3' }
+                  energyBalance: { type: string, nullable: true, example: '-20' }
+                  generationCapacity: { type: string, nullable: true }
+                  consumption: { type: string, nullable: true }
+                  generationCost: { type: string, nullable: true }
+                  validUntil: { type: string, format: date-time, nullable: true }
+                  asOfSequence: { type: string }
+                  lastOperationId: { type: string, format: uuid }
+                  lastOperationType: { type: string }
+                  lastOperationAt: { type: string, format: date-time }
+                  scope: { type: string, enum: [phase1-status-and-incoming-transfers] }
+                  historicalBaseline: { type: string, enum: [zero-at-ledger-installation] }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No existen operaciones aplicadas para ese ciclo
+        '500':
+          description: No se pudo consultar el ledger
   /cycles/{cycleId}:
     get:
       parameters:

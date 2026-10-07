@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
+const ledger = require('./ledger');
 
 const PORT = process.env.PORT || 3000;
 const AUTH_REQUIRED = process.env.AUTH_REQUIRED === 'true';
@@ -127,6 +128,7 @@ async function initDb() {
       await pool.query('CREATE INDEX IF NOT EXISTS idx_events_cycle_id ON events (cycle_id);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_received_at ON api_audit (received_at DESC);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_reason ON api_audit (reason);');
+      await ledger.migrate(pool);
       console.log('[master] Conectado a Postgres. Tabla "events" lista.');
       return;
     } catch (err) {
@@ -148,23 +150,7 @@ app.get('/health', async (req, res) => {
 });
 
 async function insertEvent(event) {
-  const receivedAt = event.receivedAt || new Date().toISOString();
-  const result = await pool.query(
-    `INSERT INTO events (id, idpk, msg_id, type, cycle_id, package_body, received_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (idpk) DO NOTHING
-     RETURNING id`,
-    [
-      randomUUID(),
-      event.idpk,
-      event.msgId ?? null,
-      event.type,
-      event.cycleId ?? null,
-      event.data ?? {},
-      receivedAt,
-    ]
-  );
-  return { inserted: result.rowCount > 0, id: result.rows[0]?.id || null, receivedAt };
+  return ledger.recordEvent(pool, event);
 }
 
 async function forwardToConnector(path, body) {
@@ -255,7 +241,7 @@ app.post('/events', async (req, res) => {
     return res.status(400).json({ error: 'Body invalido, se esperaba JSON' });
   }
 
-  const { idpk, msgId, type, data, cycleId, receivedAt } = body;
+  const { idpk, type, receivedAt } = body;
 
   if (!idpk || !type) {
     return res.status(400).json({ error: 'Faltan campos requeridos: idpk, type' });
@@ -267,27 +253,26 @@ app.post('/events', async (req, res) => {
     const result = await insertEvent({ ...body, receivedAt: receivedAtValue });
 
     if (!result.inserted) {
-      await pool.query(
-        `INSERT INTO api_audit (id, idpk, msg_id, type, cycle_id, reason, details, received_at)
-         VALUES ($1, $2, $3, $4, $5, 'DUPLICATE_IDPK', $6, $7)`,
-        [
-          randomUUID(),
-          idpk,
-          UUID_PATTERN.test(String(msgId || '')) ? msgId : null,
-          type,
-          cycleId ?? null,
-          JSON.stringify({ message: 'Evento duplicado; no se reaplico al ledger.' }),
-          result.receivedAt,
-        ]
-      );
       return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk, duplicate: true });
     }
 
     console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);
-    res.status(201).json({ id: result.id });
+    res.status(201).json({ id: result.id, ledgerApplied: result.ledgerApplied });
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
-    res.status(500).json({ error: 'Error interno al guardar el evento' });
+    res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el evento' });
+  }
+});
+
+// Phase 1 projection; not final RF03 balances (demand/negotiations pending).
+app.get('/cycles/:cycleId/ledger', authenticate, async (req, res) => {
+  try {
+    const state = await ledger.getCycleState(pool, req.params.cycleId);
+    if (!state) return res.status(404).json({ error: 'Ciclo sin operaciones de ledger' });
+    res.json({ ...state, scope: 'phase1-status-and-incoming-transfers', historicalBaseline: 'zero-at-ledger-installation' });
+  } catch (err) {
+    console.error('[master] Error al consultar ledger:', err.message);
+    res.status(500).json({ error: 'Error al consultar ledger' });
   }
 });
 
