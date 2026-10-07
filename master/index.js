@@ -4,21 +4,26 @@ const express = require('express');
 const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
 
+const PORT = process.env.PORT || 3000;
+const AUTH_REQUIRED = process.env.AUTH_REQUIRED === 'true';
+const AUTH0_ISSUER = process.env.AUTH0_ISSUER;
+const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE;
+const AUTH0_JWKS_URL = process.env.AUTH0_JWKS_URL || (AUTH0_ISSUER ? `${AUTH0_ISSUER.replace(/\/$/, '')}/.well-known/jwks.json` : null);
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const CONNECTOR_URL = process.env.CONNECTOR_URL || 'http://connector:3001';
+const MAX_PAGE_LIMIT = 100;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-const PORT = process.env.PORT || 3000;
-const AUTH_REQUIRED = process.env.AUTH_REQUIRED === 'true';
-const AUTH0_ISSUER = process.env.AUTH0_ISSUER;
-const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE;
-const AUTH0_JWKS_URL = process.env.AUTH0_JWKS_URL || (AUTH0_ISSUER ? `${AUTH0_ISSUER.replace(/\/$/, '')}/.well-known/jwks.json` : null);
 let jwksCache = { expiresAt: 0, keys: new Map() };
 
 function unauthorized(res, message = 'Autenticacion requerida') {
@@ -53,7 +58,10 @@ async function authenticate(req, res, next) {
     const tokenHeader = JSON.parse(Buffer.from(encodedHeader, 'base64url').toString('utf8'));
     const claims = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
     if (tokenHeader.alg !== 'RS256' || typeof tokenHeader.kid !== 'string') return unauthorized(res, 'Algoritmo de token no permitido');
-    if (claims.iss !== AUTH0_ISSUER || claims.aud !== AUTH0_AUDIENCE || !Number.isFinite(claims.exp) || claims.exp <= Date.now() / 1000) {
+    const audienceValid = Array.isArray(claims.aud)
+      ? claims.aud.includes(AUTH0_AUDIENCE)
+      : claims.aud === AUTH0_AUDIENCE;
+    if (claims.iss !== AUTH0_ISSUER || !audienceValid || !Number.isFinite(claims.exp) || claims.exp <= Date.now() / 1000) {
       return unauthorized(res, 'Claims del token invalidos');
     }
     const key = await getSigningKey(tokenHeader.kid);
@@ -100,10 +108,25 @@ async function initDb() {
           seq BIGSERIAL
         );
       `);
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS api_audit (
+          id UUID PRIMARY KEY,
+          idpk TEXT,
+          msg_id UUID,
+          type TEXT NOT NULL,
+          cycle_id TEXT,
+          reason TEXT NOT NULL,
+          details JSONB NOT NULL DEFAULT '{}'::jsonb,
+          received_at TIMESTAMPTZ NOT NULL,
+          seq BIGSERIAL
+        );
+      `);
       await pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS msg_id UUID;');
       await pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS cycle_id TEXT;');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_events_seq ON events (seq);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_events_cycle_id ON events (cycle_id);');
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_received_at ON api_audit (received_at DESC);');
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_reason ON api_audit (reason);');
       console.log('[master] Conectado a Postgres. Tabla "events" lista.');
       return;
     } catch (err) {
@@ -124,6 +147,107 @@ app.get('/health', async (req, res) => {
   }
 });
 
+async function insertEvent(event) {
+  const receivedAt = event.receivedAt || new Date().toISOString();
+  const result = await pool.query(
+    `INSERT INTO events (id, idpk, msg_id, type, cycle_id, package_body, received_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (idpk) DO NOTHING
+     RETURNING id`,
+    [
+      randomUUID(),
+      event.idpk,
+      event.msgId ?? null,
+      event.type,
+      event.cycleId ?? null,
+      event.data ?? {},
+      receivedAt,
+    ]
+  );
+  return { inserted: result.rowCount > 0, id: result.rows[0]?.id || null, receivedAt };
+}
+
+async function forwardToConnector(path, body) {
+  const response = await fetch(`${CONNECTOR_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(result.error || `connector respondió ${response.status}`);
+    error.statusCode = response.status;
+    throw error;
+  }
+  return result;
+}
+
+app.post('/audit', async (req, res) => {
+  const { idpk = null, msgId = null, type = 'unknown', cycleId = null, reason, details = {}, receivedAt } = req.body || {};
+  if (!['DUPLICATE_IDPK', 'DISCARDED', 'NACK'].includes(reason)) {
+    return res.status(400).json({ error: 'reason de auditoria invalido' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO api_audit (id, idpk, msg_id, type, cycle_id, reason, details, received_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [
+        randomUUID(),
+        idpk,
+        UUID_PATTERN.test(String(msgId || '')) ? msgId : null,
+        type,
+        cycleId,
+        reason,
+        details,
+        receivedAt || new Date().toISOString(),
+      ]
+    );
+    return res.status(201).json({ recorded: true });
+  } catch (err) {
+    console.error('[master] Error al registrar auditoria:', err.message);
+    return res.status(500).json({ error: 'Error interno al registrar auditoria' });
+  }
+});
+
+app.get('/audit', authenticate, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
+  const allowedReasons = new Set(['DUPLICATE_IDPK', 'DISCARDED', 'NACK']);
+  const reason = req.query.reason === undefined ? null : String(req.query.reason);
+
+  if (reason !== null && !allowedReasons.has(reason)) {
+    return res.status(400).json({ error: 'reason debe ser DUPLICATE_IDPK, DISCARDED o NACK' });
+  }
+
+  const values = [];
+  const whereSql = reason === null ? '' : 'WHERE reason = $1';
+  if (reason !== null) values.push(reason);
+
+  try {
+    const countResult = await pool.query(`SELECT COUNT(*)::int AS total FROM api_audit ${whereSql}`, values);
+    const total = countResult.rows[0].total;
+    const offset = (page - 1) * limit;
+    const result = await pool.query(
+      `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
+              reason, details, received_at AS "receivedAt"
+       FROM api_audit ${whereSql}
+       ORDER BY seq DESC
+       LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      [...values, limit, offset]
+    );
+    return res.json({
+      page,
+      limit,
+      total,
+      totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+      data: result.rows,
+    });
+  } catch (err) {
+    console.error('[master] Error al consultar /audit:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar auditoria' });
+  }
+});
+
 app.post('/events', async (req, res) => {
   const body = req.body;
 
@@ -137,33 +261,118 @@ app.post('/events', async (req, res) => {
     return res.status(400).json({ error: 'Faltan campos requeridos: idpk, type' });
   }
 
-  const id = randomUUID();
   const receivedAtValue = receivedAt || new Date().toISOString();
 
   try {
-    const result = await pool.query(
-      `INSERT INTO events (id, idpk, msg_id, type, cycle_id, package_body, received_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (idpk) DO NOTHING
-       RETURNING id`,
-      [id, idpk, msgId ?? null, type, cycleId ?? null, data ?? body, receivedAtValue]
-    );
+    const result = await insertEvent({ ...body, receivedAt: receivedAtValue });
 
-    if (result.rowCount === 0) {
-      return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk });
+    if (!result.inserted) {
+      await pool.query(
+        `INSERT INTO api_audit (id, idpk, msg_id, type, cycle_id, reason, details, received_at)
+         VALUES ($1, $2, $3, $4, $5, 'DUPLICATE_IDPK', $6, $7)`,
+        [
+          randomUUID(),
+          idpk,
+          UUID_PATTERN.test(String(msgId || '')) ? msgId : null,
+          type,
+          cycleId ?? null,
+          JSON.stringify({ message: 'Evento duplicado; no se reaplico al ledger.' }),
+          result.receivedAt,
+        ]
+      );
+      return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk, duplicate: true });
     }
 
-    console.log(`[master] Evento almacenado. id=${id} idpk=${idpk}`);
-    res.status(201).json({ id });
+    console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);
+    res.status(201).json({ id: result.id });
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
     res.status(500).json({ error: 'Error interno al guardar el evento' });
   }
 });
 
+app.get('/cycles', authenticate, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
+  try {
+    const result = await pool.query(
+      `SELECT cycle_id AS "cycleId",
+              COUNT(*)::int AS "operationCount",
+              MIN(received_at) AS "startedAt",
+              MAX(received_at) AS "lastOperationAt",
+              (ARRAY_AGG(type ORDER BY seq DESC))[1] AS "lastOperationType",
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'status-statement'), '[]') AS "statusStatements",
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'transfer'), '[]') AS transfers,
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'demand-statement'), '[]') AS "demandStatements",
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'negotiation-proposal'), '[]') AS negotiations,
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'negotiation-report'), '[]') AS "negotiationReports",
+              (ARRAY_AGG(package_body ORDER BY seq DESC) FILTER (WHERE type = 'negotiation-report'))[1] AS "finalBalances"
+       FROM events
+       WHERE cycle_id IS NOT NULL
+       GROUP BY cycle_id
+       ORDER BY MAX(seq) DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, (page - 1) * limit]
+    );
+    return res.json({ page, limit, data: result.rows });
+  } catch (err) {
+    console.error('[master] Error al consultar /cycles:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar ciclos' });
+  }
+});
+
+app.get('/cycles/:cycleId', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT cycle_id AS "cycleId",
+              COUNT(*)::int AS "operationCount",
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'status-statement'), '[]') AS "statusStatements",
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'transfer'), '[]') AS transfers,
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'demand-statement'), '[]') AS "demandStatements",
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type IN ('negotiation-proposal', 'give', 'take', 'transfer')), '[]') AS negotiations,
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'negotiation-report'), '[]') AS "negotiationReports",
+              (ARRAY_AGG(package_body ORDER BY seq DESC) FILTER (WHERE type = 'negotiation-report'))[1] AS "finalBalances",
+              (ARRAY_AGG(type ORDER BY seq DESC))[1] AS "lastOperationType",
+              (ARRAY_AGG(received_at ORDER BY seq DESC))[1] AS "lastOperationAt"
+       FROM events
+       WHERE cycle_id = $1
+       GROUP BY cycle_id`,
+      [req.params.cycleId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Ciclo no encontrado' });
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[master] Error al consultar ciclo:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar ciclo' });
+  }
+});
+
+app.post('/negotiations', authenticate, async (req, res) => {
+  const { cycleId, direction, quantity, pricePerEnergy } = req.body || {};
+  if (!cycleId || !['give', 'take'].includes(direction) ||
+      !Number.isFinite(quantity) || quantity <= 0 ||
+      !Number.isFinite(pricePerEnergy) || pricePerEnergy < 0) {
+    return res.status(400).json({ error: 'cycleId, direction, quantity y pricePerEnergy invalidos' });
+  }
+  const event = {
+    idpk: randomUUID(),
+    type: 'negotiation-proposal',
+    cycleId,
+    data: { direction, quantity, pricePerEnergy },
+  };
+  try {
+    const message = await forwardToConnector('/publish', event);
+    const stored = await insertEvent({ ...message, receivedAt: new Date().toISOString() });
+    return res.status(201).json({ ...message, eventId: stored.id, status: 'pending' });
+  } catch (err) {
+    console.error('[master] Error al publicar propuesta:', err.message);
+    return res.status(err.statusCode || 502).json({ error: 'No se pudo publicar la propuesta' });
+  }
+});
+
 app.get('/history', authenticate, async (req, res) => {
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  const limit = Math.max(parseInt(req.query.limit, 10) || 25, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
 
   const allowedColumns = {
     id: 'id', idpk: 'idpk', msgId: 'msg_id', type: 'type', cycleId: 'cycle_id', receivedAt: 'received_at',
@@ -176,7 +385,9 @@ app.get('/history', authenticate, async (req, res) => {
   for (const [key, value] of Object.entries(req.query)) {
     if (reserved.has(key)) continue;
     const column = allowedColumns[key];
-    if (!column) continue;
+    if (!column) {
+      return res.status(400).json({ error: `Parametro de filtro no soportado: ${key}` });
+    }
 
     if (column === 'received_at' && /^\d{4}-\d{2}-\d{2}$/.test(String(value))) {
       values.push(`${value}%`);
@@ -197,7 +408,9 @@ app.get('/history', authenticate, async (req, res) => {
 
     const dataResult = await pool.query(
             `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
-              package_body AS data, received_at AS "receivedAt"
+              package_body AS data, received_at AS "receivedAt",
+              CASE WHEN ROW_NUMBER() OVER (PARTITION BY cycle_id ORDER BY seq DESC) = 1
+                   THEN true ELSE false END AS "lastOperation"
        FROM events
        ${whereSql}
        ORDER BY seq ASC
@@ -213,6 +426,9 @@ app.get('/history', authenticate, async (req, res) => {
 });
 
 app.get('/history/:id', authenticate, async (req, res) => {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(req.params.id)) {
+    return res.status(400).json({ error: 'El id debe ser un UUID valido' });
+  }
   try {
     const result = await pool.query(
             `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
@@ -253,9 +469,42 @@ app.get('/negotiations', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, idpk, msg_id AS "msgId", cycle_id AS "cycleId", type,
-              package_body AS data, received_at AS "receivedAt"
+              package_body AS data, received_at AS "receivedAt",
+              CASE type
+                WHEN 'negotiation-proposal' THEN CASE
+                  WHEN EXISTS (
+                    SELECT 1 FROM events confirmation
+                    WHERE confirmation.type IN ('give', 'take')
+                      AND confirmation.package_body->>'target' = events.msg_id::text
+                  ) AND EXISTS (
+                    SELECT 1 FROM events payment
+                    WHERE payment.type = 'transfer'
+                      AND payment.package_body->>'becauseOf' IN (
+                        SELECT confirmation.msg_id::text FROM events confirmation
+                        WHERE confirmation.type IN ('give', 'take')
+                          AND confirmation.package_body->>'target' = events.msg_id::text
+                      )
+                  ) THEN 'paid'
+                  WHEN EXISTS (
+                    SELECT 1 FROM events confirmation
+                    WHERE confirmation.type IN ('give', 'take')
+                      AND confirmation.package_body->>'target' = events.msg_id::text
+                  ) THEN 'confirmed'
+                  WHEN EXISTS (
+                    SELECT 1 FROM events failure
+                    WHERE failure.type = 'error'
+                      AND failure.package_body->>'target' = events.msg_id::text
+                  ) THEN 'expired'
+                  ELSE 'pending'
+                END
+                WHEN 'give' THEN 'confirmed'
+                WHEN 'take' THEN 'confirmed'
+                WHEN 'transfer' THEN 'paid'
+                WHEN 'error' THEN 'failed'
+                ELSE 'unknown'
+              END AS status
        FROM events
-       WHERE type IN ('negotiation-proposal', 'give', 'take', 'transfer', 'error')
+       WHERE type IN ('negotiation-proposal', 'give', 'take', 'transfer', 'negotiation-report', 'error')
        ORDER BY seq DESC
        LIMIT $1`,
       [limit]

@@ -26,10 +26,17 @@ Deberías ver:
 - `GET /history?cycleId=cycle-9431&type=transfer` — filtros de historial.
 - `GET /connectivity` — ultima `distance-table` recibida (RF02).
 - `GET /negotiations?limit=25` — propuestas, confirmaciones, pagos y errores (RF04).
+- `GET /audit?reason=DUPLICATE_IDPK` — auditoría paginada de duplicados y mensajes
+  descartados/rechazados (RF05).
 - `GET /history?receivedAt=2026-08-27` — filtro por propiedades, con
   matching especial por fecha (prefijo `YYYY-MM-DD`) para campos de tiempo
   (RF4).
 - `GET /history/:id` — detalle de un registro por su `id`.
+- `GET /cycles` y `GET /cycles/:cycleId` — resumen consolidado de RF01.
+- `POST /negotiations` — crea una propuesta y la publica hacia la central (RF04).
+
+Los listados limitan `limit` a 100 elementos. `/history` agrega
+`lastOperation=true` al último evento persistido de cada ciclo.
 
 La especificacion completa esta en `../docs/openapi.yaml`.
 

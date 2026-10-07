@@ -47,6 +47,9 @@ paths:
         - in: query
           name: type
           schema: { type: string }
+        - in: query
+          name: receivedAt
+          schema: { type: string, format: date }
       responses:
         '200':
           description: Historial paginado de mensajes persistidos
@@ -56,6 +59,8 @@ paths:
                 $ref: '#/components/schemas/PaginatedEvents'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '400':
+          description: Filtro o paginacion invalida
   /history/{id}:
     get:
       parameters:
@@ -70,6 +75,39 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           description: Evento no encontrado
+  /cycles:
+    get:
+      description: Resumen paginado de los ciclos con sus operaciones y balances finales.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Resumen de ciclos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCycles'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /cycles/{cycleId}:
+    get:
+      parameters:
+        - in: path
+          name: cycleId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Detalle consolidado del ciclo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CycleSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Ciclo no encontrado
   /connectivity:
     get:
       responses:
@@ -95,6 +133,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PaginatedEvents'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      description: Crea y publica una propuesta voluntaria hacia la central.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NegotiationProposalRequest'
+      responses:
+        '201':
+          description: Propuesta publicada y registrada como pendiente
+        '400':
+          description: Datos invalidos
+        '502':
+          description: Connector o broker no disponible
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /audit:
+    get:
+      description: Registro consultable de duplicados y otros mensajes rechazados o descartados.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: reason
+          schema:
+            type: string
+            enum: [DUPLICATE_IDPK, DISCARDED, NACK]
+      responses:
+        '200':
+          description: Auditoria paginada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAudit'
+        '400':
+          description: Razon invalida
         '401':
           $ref: '#/components/responses/Unauthorized'
 components:
@@ -150,6 +227,20 @@ components:
         cycleId: { type: string, nullable: true }
         data: { type: object, additionalProperties: true }
         receivedAt: { type: string, format: date-time }
+        lastOperation: { type: boolean }
+        status: { type: string, enum: [pending, confirmed, paid, expired, failed, unknown] }
+    AuditEntry:
+      type: object
+      required: [id, type, reason, receivedAt]
+      properties:
+        id: { type: string, format: uuid }
+        idpk: { type: string, nullable: true }
+        msgId: { type: string, format: uuid, nullable: true }
+        type: { type: string }
+        cycleId: { type: string, nullable: true }
+        reason: { type: string, enum: [DUPLICATE_IDPK, DISCARDED, NACK] }
+        details: { type: object, additionalProperties: true }
+        receivedAt: { type: string, format: date-time }
     PaginatedEvents:
       type: object
       required: [data]
@@ -161,3 +252,43 @@ components:
         data:
           type: array
           items: { $ref: '#/components/schemas/Event' }
+    PaginatedAudit:
+      type: object
+      required: [page, limit, total, totalPages, data]
+      properties:
+        page: { type: integer }
+        limit: { type: integer, maximum: 100 }
+        total: { type: integer }
+        totalPages: { type: integer }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEntry' }
+    NegotiationProposalRequest:
+      type: object
+      required: [cycleId, direction, quantity, pricePerEnergy]
+      properties:
+        cycleId: { type: string }
+        direction: { type: string, enum: [give, take] }
+        quantity: { type: number, exclusiveMinimum: 0 }
+        pricePerEnergy: { type: number, minimum: 0 }
+    CycleSummary:
+      type: object
+      required: [cycleId, operationCount, lastOperationType]
+      properties:
+        cycleId: { type: string }
+        operationCount: { type: integer }
+        statusStatements: { type: array, items: { type: object } }
+        transfers: { type: array, items: { type: object } }
+        demandStatements: { type: array, items: { type: object } }
+        negotiations: { type: array, items: { type: object } }
+        negotiationReports: { type: array, items: { type: object } }
+        finalBalances: { type: object, nullable: true }
+        lastOperationType: { type: string }
+        lastOperationAt: { type: string, format: date-time }
+    PaginatedCycles:
+      type: object
+      required: [page, limit, data]
+      properties:
+        page: { type: integer }
+        limit: { type: integer, maximum: 100 }
+        data: { type: array, items: { $ref: '#/components/schemas/CycleSummary' } }
