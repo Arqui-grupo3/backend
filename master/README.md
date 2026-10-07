@@ -1,9 +1,7 @@
-# Master POC - EnergyShark (Entrega 0, punto 2 del roadmap)
+# Master API - EnergyShark (Entrega 1)
 
-Servidor HTTP (Express) que recibe eventos desde `connector` vía POST y los
-deja disponibles para consulta. Por ahora guarda todo **en memoria** (se
-pierde al reiniciar) — la base de datos real (Postgres/Mongo, RNF6) se
-integra en un paso posterior del roadmap.
+Servidor HTTP (Express) que recibe eventos v2 desde `connector` vía POST y los
+persiste en Postgres para exponerlos como API JSON.
 
 ## Uso
 
@@ -23,13 +21,24 @@ Deberías ver:
 
 - `GET /health` — para el HEALTHCHECK del container más adelante (RNF7).
 - `POST /events` — usado por `connector` para entregar cada evento recibido
-  del broker. Body: el evento tal cual (`idpk`, `type`, `packageBody`, y
-  opcionalmente `receivedAt`).
-- `GET /history?page=1&limit=25` — historial paginado (RF1 + RF3).
+  del broker. Body: envelope v2 (`idpk`, `msgId`, `type`, `timestamp`, `data`).
+- `GET /history?page=1&limit=25` — historial paginado (RF01).
+- `GET /history?cycleId=cycle-9431&type=transfer` — filtros de historial.
+- `GET /connectivity` — ultima `distance-table` recibida (RF02).
+- `GET /negotiations?limit=25` — propuestas, confirmaciones, pagos y errores (RF04).
 - `GET /history?receivedAt=2026-08-27` — filtro por propiedades, con
   matching especial por fecha (prefijo `YYYY-MM-DD`) para campos de tiempo
   (RF4).
-- `GET /history/:id` — detalle de un registro por su `id` (RF2).
+- `GET /history/:id` — detalle de un registro por su `id`.
+
+La especificacion completa esta en `../docs/openapi.yaml`.
+
+## Auth0
+
+En produccion, `AUTH_REQUIRED=true` protege las rutas de consulta con un JWT
+RS256. Configura `AUTH0_ISSUER`, `AUTH0_AUDIENCE` y opcionalmente
+`AUTH0_JWKS_URL`. El endpoint interno `POST /events` no usa este middleware
+porque solo lo invoca el connector dentro de la red privada.
 
 ## Probarlo manualmente (sin el connector corriendo)
 
@@ -59,5 +68,5 @@ curl "http://localhost:3000/history/<id-que-te-devolvio-el-POST>"
 3. Correr ambos juntos: `connector` ahora hace POST a `master` en vez de
    solo loguear (ver `connector/.env` → `MASTER_URL`).
 4. Dockerizar ambos servicios.
-5. Reemplazar el almacenamiento en memoria por Postgres/Mongo.
-6. EC2 + Docker + DNS + Nginx.
+5. Conectar API Gateway con el authorizer Auth0.
+6. Publicar la SPA y API con HTTPS.

@@ -44,6 +44,10 @@ services:
       NEW_RELIC_LICENSE_KEY: ${NEW_RELIC_LICENSE_KEY}
       NEW_RELIC_APP_NAME: energyshark-master
       NEW_RELIC_LOG: stdout
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-true}
+      AUTH0_ISSUER: ${AUTH0_ISSUER}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
+      AUTH0_JWKS_URL: ${AUTH0_JWKS_URL}
     depends_on:
       db:
         condition: service_healthy

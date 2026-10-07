@@ -30,6 +30,10 @@ services:
       PGUSER: ${POSTGRES_USER:-energyshark}
       PGPASSWORD: ${POSTGRES_PASSWORD:-energyshark}
       PGDATABASE: ${POSTGRES_DB:-energyshark}
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
+      AUTH0_ISSUER: ${AUTH0_ISSUER:-}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:-}
+      AUTH0_JWKS_URL: ${AUTH0_JWKS_URL:-}
     depends_on:
       db:
         condition: service_healthy
