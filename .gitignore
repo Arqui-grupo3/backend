@@ -6,7 +6,7 @@ node_modules/
 *:Zone.Identifier
 Thumbs.db
 desktop.ini
-.DS_Store
+.DS_Store*:Zone.Identifier
 node_modules/
 .env
 *.pem
@@ -15,4 +15,4 @@ node_modules/
 *:Zone.Identifier
 Thumbs.db
 desktop.ini
-.DS_Store*:Zone.Identifier
+
