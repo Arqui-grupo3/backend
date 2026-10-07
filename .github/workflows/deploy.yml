@@ -70,12 +70,13 @@ jobs:
       # así la máquina nunca queda con una versión distinta a la del repo.
       - name: Copiar el compose de producción
         run: |
-          scp -i ~/.ssh/deploy_key docker-compose.prod.yml \
+          scp -i ~/.ssh/deploy_key -o ServerAliveInterval=30 docker-compose.prod.yml \
             ubuntu@${{ secrets.EC2_HOST }}:~/energyshark/docker-compose.prod.yml
 
       - name: Pull y levantar
         run: |
-          ssh -i ~/.ssh/deploy_key ubuntu@${{ secrets.EC2_HOST }} bash -s <<'REMOTE'
+          ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+              ubuntu@${{ secrets.EC2_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             cd ~/energyshark
 
