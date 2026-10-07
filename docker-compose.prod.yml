@@ -41,6 +41,9 @@ services:
       PGUSER: ${POSTGRES_USER:-energyshark}
       PGPASSWORD: ${POSTGRES_PASSWORD:-energyshark}
       PGDATABASE: ${POSTGRES_DB:-energyshark}
+      NEW_RELIC_LICENSE_KEY: ${NEW_RELIC_LICENSE_KEY}
+      NEW_RELIC_APP_NAME: energyshark-master
+      NEW_RELIC_LOG: stdout
     depends_on:
       db:
         condition: service_healthy
