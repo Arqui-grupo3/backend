@@ -14,6 +14,7 @@ jobs:
   build-and-push:
     name: Construir y publicar imágenes en ECR
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -54,6 +55,21 @@ jobs:
     name: Desplegar en la EC2
     needs: build-and-push
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Opciones compartidas por todas las conexiones al servidor:
+    #   ServerAliveInterval  manda un latido cada 30 s para que el NAT no corte
+    #                        la conexión mientras el pull descarga en silencio
+    #   StrictHostKeyChecking=accept-new  acepta la huella la primera vez, sin
+    #                        depender de que ssh-keyscan haya funcionado
+    #   ConnectTimeout       falla rápido si el host no responde, en vez de
+    #                        quedarse colgado hasta el timeout del job
+    env:
+      SSH_OPTS: >-
+        -o ServerAliveInterval=30
+        -o ServerAliveCountMax=20
+        -o StrictHostKeyChecking=accept-new
+        -o ConnectTimeout=20
 
     steps:
       - name: Checkout
@@ -64,18 +80,20 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          # ssh-keyscan es best-effort: si falla, accept-new resuelve la huella
+          # igual. Sin el || true, un fallo suyo tumba todo el despliegue.
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
 
       # El compose de producción viaja del repo al servidor en cada deploy,
       # así la máquina nunca queda con una versión distinta a la del repo.
       - name: Copiar el compose de producción
         run: |
-          scp -i ~/.ssh/deploy_key -o ServerAliveInterval=30 docker-compose.prod.yml \
+          scp -i ~/.ssh/deploy_key $SSH_OPTS docker-compose.prod.yml \
             ubuntu@${{ secrets.EC2_HOST }}:~/energyshark/docker-compose.prod.yml
 
       - name: Pull y levantar
         run: |
-          ssh -i ~/.ssh/deploy_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
+          ssh -i ~/.ssh/deploy_key $SSH_OPTS \
               ubuntu@${{ secrets.EC2_HOST }} bash -s <<'REMOTE'
             set -euo pipefail
             cd ~/energyshark
@@ -91,8 +109,18 @@ jobs:
             sudo docker compose -f docker-compose.prod.yml ps
           REMOTE
 
+      # Se verifica contra el dominio público, no contra localhost del servidor:
+      # así se comprueba el camino completo (DNS, TLS, Nginx y la aplicación).
       - name: Verificar que la API responde
         run: |
-          sleep 10
-          ssh -i ~/.ssh/deploy_key ubuntu@${{ secrets.EC2_HOST }} \
-            'curl -fsS http://localhost:3000/health'
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 10 https://www.fasantamaria.me/health; then
+              echo ""
+              echo "API respondiendo en el intento $i"
+              exit 0
+            fi
+            echo "Intento $i: todavía no responde, reintento en 10 s..."
+            sleep 10
+          done
+          echo "La API no respondió tras 20 intentos"
+          exit 1
