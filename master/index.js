@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { randomUUID } = require('crypto');
+const { Client } = require('pg');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -8,12 +9,17 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 3000;
 
 const events = [];
+const db = new Client();
+db.on('error', (err) => {
+  console.error('[master] Error de PostgreSQL:', err.message);
+  process.exit(1);
+});
 
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', uptime: process.uptime(), count: events.length });
 });
 
-app.post('/events', (req, res) => {
+app.post('/events', async (req, res) => {
   const body = req.body;
 
   if (!body || typeof body !== 'object') {
@@ -48,7 +54,22 @@ app.post('/events', (req, res) => {
     receivedAt: receivedAt || new Date().toISOString(),
   };
 
-  events.push(record);
+  try {
+    const result = await db.query(
+      `INSERT INTO events (id, idpk, type, package_body, received_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (idpk) DO NOTHING RETURNING id`,
+      [record.id, idpk, type, record, record.receivedAt]
+    );
+    if (result.rowCount === 0) {
+      return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk });
+    }
+  } catch (err) {
+    console.error('[master] Error al guardar evento:', err.message);
+    return res.status(500).json({ error: 'Error interno al guardar el evento' });
+  }
+
+  events.push({ ...record, packageBody: record });
 
   console.log(`[master] Evento almacenado. id=${record.id} idpk=${record.idpk} total=${events.length}`);
 
@@ -96,6 +117,22 @@ app.get('/history/:id', (req, res) => {
   res.json(record);
 });
 
-app.listen(PORT, () => {
-  console.log(`[master] Escuchando en http://localhost:${PORT}`);
+db.connect().then(async () => {
+  const result = await db.query('SELECT id, idpk, type, package_body, received_at FROM events ORDER BY received_at ASC, id ASC');
+  for (const row of result.rows) {
+    events.push({
+      ...row.package_body,
+      id: row.id,
+      idpk: row.idpk,
+      type: row.type,
+      packageBody: row.package_body,
+      receivedAt: row.package_body?.receivedAt || new Date(row.received_at).toISOString(),
+    });
+  }
+  app.listen(PORT, () => {
+    console.log(`[master] Escuchando en http://localhost:${PORT}`);
+  });
+}).catch((err) => {
+  console.error('[master] No se pudo iniciar PostgreSQL:', err.message);
+  process.exit(1);
 });
