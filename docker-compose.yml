@@ -30,6 +30,12 @@ services:
       PGUSER: ${POSTGRES_USER:-energyshark}
       PGPASSWORD: ${POSTGRES_PASSWORD:-energyshark}
       PGDATABASE: ${POSTGRES_DB:-energyshark}
+      NEW_RELIC_APP_NAME: ${NEW_RELIC_APP_NAME:-energyshark-master}
+      CONNECTOR_URL: http://connector:3001
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
+      AUTH0_ISSUER: ${AUTH0_ISSUER:-}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:-}
+      AUTH0_JWKS_URL: ${AUTH0_JWKS_URL:-}
     depends_on:
       db:
         condition: service_healthy
@@ -44,6 +50,7 @@ services:
       - ./connector/.env
     environment:
       MASTER_URL: http://master:3000/events
+      CONNECTOR_CONTROL_PORT: 3001
     depends_on:
       - master
     networks:
