@@ -503,3 +503,11 @@ initDb().then(() => {
     console.log(`[master] Escuchando en http://localhost:${PORT}`);
   });
 });
+
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(422).json({ reason: 'MALFORMED_MESSAGE' });
+  }
+  console.error('[master]', err.message);
+  res.status(500).json({ error: 'Error interno' });
+});
