@@ -13,6 +13,7 @@ const {
   RABBIT_VHOST = '',
   RABBIT_QUEUE,
   MASTER_URL = 'http://localhost:3000/events',
+  AUDIT_URL = new URL('audit', MASTER_URL).toString(),
 } = process.env;
 
 if (!RABBIT_URL && (!RABBIT_USER || !RABBIT_PASS)) {
@@ -40,6 +41,28 @@ function buildUrl() {
   return `amqps://${encodeURIComponent(RABBIT_USER)}:${encodeURIComponent(
     RABBIT_PASS
   )}@${RABBIT_HOST}:${RABBIT_PORT}${vhost}`;
+}
+
+async function recordAudit(entry) {
+  const response = await fetch(AUDIT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(entry),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!response.ok) throw new Error(`master respondio ${response.status} al registrar auditoria`);
+  return response.json();
+}
+
+async function discardMessage(channel, msg, entry) {
+  try {
+    await recordAudit({ category: 'DESCARTE', ...entry });
+    channel.nack(msg, false, false);
+  } catch (err) {
+    console.error('[connector] No se pudo registrar el descarte, se reencola:', err.message);
+    await sleep(MASTER_RETRY_DELAY_MS);
+    channel.nack(msg, false, true);
+  }
 }
 
 async function main() {
@@ -79,35 +102,45 @@ async function main() {
     async (msg) => {
       if (msg === null) return;
 
+      const receivedAt = new Date().toISOString();
+      const raw = msg.content.toString('utf8');
       const routingKey = msg.fields?.routingKey;
       if (!['city.REE', 'city.broadcast'].includes(routingKey)) {
-        console.error(`[connector] Routing key inesperada, se descarta: ${JSON.stringify(routingKey)}`);
-        channel.nack(msg, false, false);
+        const detail = `Routing key inesperada: ${JSON.stringify(routingKey)}`;
+        console.error(`[connector] ${detail}`);
+        await discardMessage(channel, msg, {
+          reason: 'UNEXPECTED_ROUTING_KEY', detail, rawBody: raw, routingKey, receivedAt,
+        });
         return;
       }
       const delivery = routingKey === 'city.broadcast' ? 'broadcast' : 'direct';
 
-      const receivedAt = new Date().toISOString();
-
       let event;
       try {
-        const raw = msg.content.toString('utf8');
         event = JSON.parse(raw);
       } catch (err) {
         console.error('[connector] No se pudo parsear el mensaje, se descarta:', err.message);
-        channel.nack(msg, false, false);
+        await discardMessage(channel, msg, {
+          reason: 'INVALID_JSON', detail: err.message, rawBody: raw, routingKey, receivedAt,
+        });
         return;
       }
 
       if (event === null || typeof event !== "object" || Array.isArray(event)) {
-        console.error("[connector] El mensaje no es un objeto JSON, se descarta.");
-        channel.nack(msg, false, false);
+        const detail = 'El mensaje no es un objeto JSON.';
+        console.error(`[connector] ${detail}`);
+        await discardMessage(channel, msg, {
+          reason: 'INVALID_ENVELOPE', detail, payload: event, rawBody: raw, routingKey, receivedAt,
+        });
         return;
       }
 
       if (!Object.hasOwn(event, "msgId")) {
-        console.error("[connector] El mensaje no incluye msgId, se descarta.");
-        channel.nack(msg, false, false);
+        const detail = 'El mensaje no incluye msgId.';
+        console.error(`[connector] ${detail}`);
+        await discardMessage(channel, msg, {
+          reason: 'MISSING_MSGID', detail, payload: event, rawBody: raw, routingKey, receivedAt,
+        });
         return;
       }
 
@@ -115,13 +148,29 @@ async function main() {
         const invalid = validateEnvelope(event);
         if (invalid) {
           console.error(`[connector] Mensaje rechazado: ${invalid.reason} msgId=${JSON.stringify(event.msgId)}: ${invalid.message}`);
-          if (!RESPONSE_TYPES.has(event.type)) {
-            const data = { target: event.msgId, message: invalid.message };
-            if (Object.hasOwn(event, 'cycleId')) data.cycleId = event.cycleId;
-            await publishMessage({
-              type: 'nack', reason: invalid.reason, code: invalid.code, data,
+          if (RESPONSE_TYPES.has(event.type)) {
+            await discardMessage(channel, msg, {
+              reason: 'INVALID_RESPONSE', detail: invalid.message, payload: event,
+              rawBody: raw, routingKey, receivedAt,
             });
+            return;
           }
+          const audit = await recordAudit({
+            category: 'NACK', reason: invalid.reason, code: invalid.code,
+            detail: invalid.message, payload: event, rawBody: raw, routingKey, receivedAt,
+          });
+          const data = { target: event.msgId, message: invalid.message };
+          if (Object.hasOwn(event, 'cycleId')) data.cycleId = event.cycleId;
+          const nack = await publishMessage({
+            type: 'nack', reason: invalid.reason, code: invalid.code, data,
+          });
+          const response = await fetch(`${AUDIT_URL}/${audit.id}/response`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ response: nack }),
+            signal: AbortSignal.timeout(10000),
+          });
+          if (!response.ok) throw new Error(`master respondio ${response.status} al registrar publicacion NACK`);
           channel.ack(msg);
           return;
         }
