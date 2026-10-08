@@ -6,10 +6,12 @@ const { Pool } = require('pg');
 const ledger = require('./ledger');
 const reports = require('./reports');
 const negotiations = require('./negotiations');
+
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
 if (REPORTS_ENABLED && process.env.LEDGER_BASELINE_CONFIRMED !== 'true') {
   throw new Error('Reportes requieren LEDGER_BASELINE_CONFIRMED=true tras verificar el saldo inicial.');
 }
+
 let reportWorker;
 let negotiationWorker;
 
@@ -28,7 +30,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -117,6 +119,9 @@ async function initDb() {
           seq BIGSERIAL
         );
       `);
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_events_seq ON events (seq);');
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_events_cycle_id ON events (cycle_id);');
+
       await pool.query(`
         CREATE TABLE IF NOT EXISTS api_audit (
           id UUID PRIMARY KEY,
@@ -130,14 +135,35 @@ async function initDb() {
           seq BIGSERIAL
         );
       `);
-      await pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS msg_id UUID;');
-      await pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS cycle_id TEXT;');
-      await pool.query('CREATE INDEX IF NOT EXISTS idx_events_seq ON events (seq);');
-      await pool.query('CREATE INDEX IF NOT EXISTS idx_events_cycle_id ON events (cycle_id);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_received_at ON api_audit (received_at DESC);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_reason ON api_audit (reason);');
+
+      // Tabla unificada de auditoría y rechazados (persistanceDev)
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS rejected_messages (
+          id UUID PRIMARY KEY,
+          idpk TEXT,
+          msg_id TEXT,
+          type TEXT,
+          category TEXT NOT NULL CHECK (category IN ('DUPLICADO', 'DESCARTE', 'NACK')),
+          reason TEXT NOT NULL,
+          payload JSONB,
+          received_at TIMESTAMPTZ NOT NULL,
+          seq BIGSERIAL
+        );
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_rejected_messages_idpk ON rejected_messages (idpk);');
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_rejected_messages_seq ON rejected_messages (seq DESC);');
+      await pool.query('ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS raw_body TEXT;');
+      await pool.query('ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS routing_key TEXT;');
+      await pool.query('ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS detail TEXT;');
+      await pool.query('ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS code INTEGER;');
+      await pool.query(`ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS response_status TEXT NOT NULL DEFAULT 'none'
+        CHECK (response_status IN ('none', 'pending', 'published'));`);
+      await pool.query('ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS response_payload JSONB;');
+
       await ledger.migrate(pool);
-      console.log('[master] Conectado a Postgres. Tabla "events" lista.');
+      console.log('[master] Conectado a Postgres. Tablas listas.');
       return;
     } catch (err) {
       console.error(`[master] Postgres no disponible aun (intento ${attempt}/${maxRetries}): ${err.message}`);
@@ -184,72 +210,6 @@ async function forwardToConnector(path, body) {
   return result;
 }
 
-app.post('/audit', async (req, res) => {
-  const { idpk = null, msgId = null, type = 'unknown', cycleId = null, reason, details = {}, receivedAt } = req.body || {};
-  if (!['DUPLICATE_IDPK', 'DISCARDED', 'NACK'].includes(reason)) {
-    return res.status(400).json({ error: 'reason de auditoria invalido' });
-  }
-  try {
-    await pool.query(
-      `INSERT INTO api_audit (id, idpk, msg_id, type, cycle_id, reason, details, received_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [
-        randomUUID(),
-        idpk,
-        UUID_PATTERN.test(String(msgId || '')) ? msgId : null,
-        type,
-        cycleId,
-        reason,
-        details,
-        receivedAt || new Date().toISOString(),
-      ]
-    );
-    return res.status(201).json({ recorded: true });
-  } catch (err) {
-    console.error('[master] Error al registrar auditoria:', err.message);
-    return res.status(500).json({ error: 'Error interno al registrar auditoria' });
-  }
-});
-
-app.get('/audit', authenticate, async (req, res) => {
-  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
-  const allowedReasons = new Set(['DUPLICATE_IDPK', 'DISCARDED', 'NACK']);
-  const reason = req.query.reason === undefined ? null : String(req.query.reason);
-
-  if (reason !== null && !allowedReasons.has(reason)) {
-    return res.status(400).json({ error: 'reason debe ser DUPLICATE_IDPK, DISCARDED o NACK' });
-  }
-
-  const values = [];
-  const whereSql = reason === null ? '' : 'WHERE reason = $1';
-  if (reason !== null) values.push(reason);
-
-  try {
-    const countResult = await pool.query(`SELECT COUNT(*)::int AS total FROM api_audit ${whereSql}`, values);
-    const total = countResult.rows[0].total;
-    const offset = (page - 1) * limit;
-    const result = await pool.query(
-      `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
-              reason, details, received_at AS "receivedAt"
-       FROM api_audit ${whereSql}
-       ORDER BY seq DESC
-       LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
-      [...values, limit, offset]
-    );
-    return res.json({
-      page,
-      limit,
-      total,
-      totalPages: total === 0 ? 0 : Math.ceil(total / limit),
-      data: result.rows,
-    });
-  } catch (err) {
-    console.error('[master] Error al consultar /audit:', err.message);
-    return res.status(500).json({ error: 'Error interno al consultar auditoria' });
-  }
-});
-
 app.post('/events', async (req, res) => {
   const body = req.body;
 
@@ -269,6 +229,14 @@ app.post('/events', async (req, res) => {
     const result = await insertEvent({ ...body, receivedAt: receivedAtValue });
 
     if (!result.inserted) {
+      // Registro de duplicado en rejected_messages (flujo persistanceDev)
+      await pool.query(
+        `INSERT INTO rejected_messages
+         (id, idpk, msg_id, type, category, reason, payload, received_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [randomUUID(), idpk, typeof body.msgId === 'string' ? body.msgId : null,
+          type, 'DUPLICADO', 'DUPLICATE_IDPK', JSON.stringify(body), receivedAtValue]
+      );
       return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk, duplicate: true });
     }
 
@@ -277,6 +245,131 @@ app.post('/events', async (req, res) => {
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el evento' });
+  }
+});
+
+// Endpoint unificado de auditoría para recibir NACKs y descartes desde el conector
+app.post('/audit', async (req, res) => {
+  const body = req.body;
+  const discardReasons = new Set(['INVALID_JSON', 'INVALID_ENVELOPE', 'MISSING_MSGID', 'UNEXPECTED_ROUTING_KEY', 'INVALID_RESPONSE']);
+  const nackCodes = { MALFORMED_MESSAGE: 422, UNKNOWN_TYPE: 400, IDPK_EQUALS_MSGID: 422, IDENTITY_MISMATCH: 403 };
+  
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+      || !['DESCARTE', 'NACK'].includes(body.category) || typeof body.reason !== 'string'
+      || typeof body.rawBody !== 'string' || typeof body.detail !== 'string' || !body.detail.trim()
+      || (body.routingKey !== undefined && typeof body.routingKey !== 'string')) {
+    return res.status(400).json({ error: 'Registro de auditoria invalido' });
+  }
+  if (body.category === 'DESCARTE' && !discardReasons.has(body.reason)) {
+    return res.status(400).json({ error: 'Motivo de descarte invalido' });
+  }
+  if (body.category === 'NACK' && (!Object.hasOwn(nackCodes, body.reason) || body.code !== nackCodes[body.reason]
+      || !body.payload || typeof body.payload !== 'object' || Array.isArray(body.payload)
+      || !Object.hasOwn(body.payload, 'msgId'))) {
+    return res.status(400).json({ error: 'Registro NACK requiere reason/code validos y el mensaje rechazado con msgId' });
+  }
+  
+  const receivedAt = body.receivedAt ?? new Date().toISOString();
+  if (typeof receivedAt !== 'string' || !Number.isFinite(Date.parse(receivedAt))) {
+    return res.status(400).json({ error: 'receivedAt debe ser una fecha valida' });
+  }
+  
+  const payload = body.payload ?? null;
+  const id = randomUUID();
+  try {
+    await pool.query(
+      `INSERT INTO rejected_messages
+       (id, idpk, msg_id, type, category, reason, payload, received_at, raw_body, routing_key, detail, code, response_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [id, typeof payload?.idpk === 'string' ? payload.idpk : null,
+        typeof payload?.msgId === 'string' ? payload.msgId : null,
+        typeof payload?.type === 'string' ? payload.type : null,
+        body.category, body.reason, JSON.stringify(payload), receivedAt,
+        body.rawBody, body.routingKey ?? null, body.detail,
+        body.category === 'NACK' ? body.code : null, body.category === 'NACK' ? 'pending' : 'none']
+    );
+    res.status(201).json({ id });
+  } catch (err) {
+    console.error('[master] Error al guardar auditoria:', err.message);
+    res.status(500).json({ error: 'Error interno al guardar la auditoria' });
+  }
+});
+
+app.patch('/audit/:id/response', async (req, res) => {
+  const response = req.body?.response;
+  const isUuid = value => typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  const nackCodes = { MALFORMED_MESSAGE: 422, UNKNOWN_TYPE: 400, IDPK_EQUALS_MSGID: 422, IDENTITY_MISMATCH: 403 };
+  
+  if (!isUuid(req.params.id) || !response || response.type !== 'nack' || response.cityId !== 'REE'
+      || !isUuid(response.msgId) || !isUuid(response.idpk) || response.msgId.toLowerCase() === response.idpk.toLowerCase()
+      || typeof response.reason !== 'string' || !Object.hasOwn(nackCodes, response.reason)
+      || response.code !== nackCodes[response.reason] || !response.data
+      || !Object.hasOwn(response.data, 'target') || typeof response.data.message !== 'string'
+      || !response.data.message.trim()) {
+    return res.status(400).json({ error: 'Respuesta NACK invalida' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE rejected_messages SET response_status = 'published', response_payload = $2::jsonb
+       WHERE id = $1 AND category = 'NACK' AND reason = $3 AND code = $4
+         AND payload->'msgId' = $5::jsonb AND detail = $6
+         AND (response_status = 'pending' OR response_payload = $2::jsonb)
+       RETURNING id`,
+      [req.params.id, JSON.stringify(response), response.reason, response.code,
+        JSON.stringify(response.data.target), response.data.message]
+    );
+    if (result.rowCount === 0) {
+      const exists = await pool.query('SELECT id FROM rejected_messages WHERE id = $1', [req.params.id]);
+      return res.status(exists.rowCount ? 409 : 404).json({ error: 'Registro no encontrado o respuesta no corresponde al NACK registrado' });
+    }
+    res.json({ id: req.params.id, responseStatus: 'published' });
+  } catch (err) {
+    console.error('[master] Error al registrar publicacion NACK:', err.message);
+    res.status(500).json({ error: 'Error interno al registrar la publicacion NACK' });
+  }
+});
+
+// GET Audit ahora expone el flujo enriquecido de persistanceDev
+app.get('/audit', authenticate, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
+  const offset = (page - 1) * limit;
+
+  const filters = { category: 'category', idpk: 'idpk', msgId: 'msg_id', type: 'type', reason: 'reason', responseStatus: 'response_status' };
+  const clauses = [];
+  const values = [];
+  
+  for (const [key, column] of Object.entries(filters)) {
+    const value = req.query[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'string') {
+      return res.status(400).json({ error: `${key} debe ser un texto` });
+    }
+    values.push(value);
+    clauses.push(`${column} = $${values.length}`);
+  }
+  const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  try {
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM rejected_messages ${whereSql}`, values
+    );
+    const total = countResult.rows[0].total;
+    const result = await pool.query(
+      `SELECT id, idpk, msg_id AS "msgId", type, category, reason, code, detail,
+              payload, raw_body AS "rawBody", routing_key AS "routingKey", received_at AS "receivedAt",
+              response_status AS "responseStatus", response_payload AS "responsePayload"
+       FROM rejected_messages
+       ${whereSql}
+       ORDER BY seq DESC
+       LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      [...values, limit, offset]
+    );
+    res.json({ page, limit, total, totalPages: Math.max(Math.ceil(total / limit), 1), data: result.rows });
+  } catch (err) {
+    console.error('[master] Error al consultar /audit:', err.message);
+    res.status(500).json({ error: 'Error interno al consultar la auditoria' });
   }
 });
 
@@ -291,7 +384,6 @@ app.get('/cycles/:cycleId/report', authenticate, async (req, res) => {
   }
 });
 
-// Projection includes central demands; voluntary negotiations remain pending.
 app.get('/cycles/:cycleId/ledger', authenticate, async (req, res) => {
   try {
     const state = await ledger.getCycleState(pool, req.params.cycleId);
@@ -408,7 +500,7 @@ app.get('/history', authenticate, async (req, res) => {
     const offset = (page - 1) * limit;
 
     const dataResult = await pool.query(
-            `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
+      `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
               package_body AS data, received_at AS "receivedAt",
               CASE WHEN ROW_NUMBER() OVER (PARTITION BY cycle_id ORDER BY seq DESC) = 1
                    THEN true ELSE false END AS "lastOperation"
@@ -432,7 +524,7 @@ app.get('/history/:id', authenticate, async (req, res) => {
   }
   try {
     const result = await pool.query(
-            `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
+      `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
               package_body AS data, received_at AS "receivedAt"
        FROM events WHERE id = $1`,
       [req.params.id]
@@ -446,6 +538,26 @@ app.get('/history/:id', authenticate, async (req, res) => {
   } catch (err) {
     console.error('[master] Error al consultar /history/:id:', err.message);
     res.status(500).json({ error: 'Error interno al consultar el registro' });
+  }
+});
+
+app.get('/distance-table', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, idpk, type, package_body AS "data", received_at AS "receivedAt"
+       FROM events
+       WHERE type = 'distance-table'
+         AND jsonb_typeof(package_body->'distances') = 'object'
+       ORDER BY seq DESC
+       LIMIT 1`
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'No hay una distance-table vigente registrada' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[master] Error al consultar /distance-table:', err.message);
+    res.status(500).json({ error: 'Error interno al consultar la distance-table vigente' });
   }
 });
 
