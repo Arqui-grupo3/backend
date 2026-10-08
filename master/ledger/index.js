@@ -36,7 +36,7 @@ async function migrate(pool) {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(2173, 1)');
     await client.query('CREATE TABLE IF NOT EXISTS ledger_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())');
-    for (const name of ['001-ledger.sql', '002-demand.sql']) {
+    for (const name of ['001-ledger.sql', '002-demand.sql', '003-reports.sql']) {
       const applied = await client.query('SELECT 1 FROM ledger_migrations WHERE name=$1', [name]);
       if (!applied.rowCount) {
         await client.query(readFileSync(join(__dirname, '../migrations', name), 'utf8'));
@@ -76,6 +76,7 @@ async function recordEvent(pool, event) {
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [id,idpk,event.msgId,event.cycleId,event.type,event.data,event,event.timestamp]);
     }
+    await require('../reports').onEvent(client, event);
     await client.query('COMMIT');
     return { inserted: true, id, receivedAt, ledgerApplied: ledgerTypes.has(event.type) };
   } catch (err) { await client.query('ROLLBACK'); throw err; }

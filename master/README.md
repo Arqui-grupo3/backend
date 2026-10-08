@@ -89,7 +89,7 @@ curl "http://localhost:3000/history/<id-que-te-devolvio-el-POST>"
 La implementación y sus decisiones están explicadas en
 [`../docs/ledger-fase1.md`](../docs/ledger-fase1.md).
 
-- `POST /events` guarda el historial y aplica `status-statement` / `transfer`
+- `POST /events` guarda el historial y aplica `status-statement` / `transfer` / `demand-statement`
   recibidos dentro de la misma transacción. Devuelve `ledgerApplied` en una
   inserción nueva. Los otros tipos quedan en historial sin efecto contable todavía.
 - `GET /cycles/:cycleId/ledger` expone la proyección con el middleware Auth0
@@ -111,3 +111,21 @@ La suite exige esa variable explícita, crea un esquema aleatorio, inicia el
 servidor HTTP real y borra únicamente ese esquema al terminar. No usa el broker,
 AWS, Auth0 ni una base de producción. Prueba migración desde E0, duplicados
 concurrentes, decimales, orden de llegada, rollback y reinicio del proceso.
+
+## Demandas y reportes P3
+
+Ver [guía de demandas y reportes](../docs/p3-demand-report.md) para ejemplos,
+estados y pruebas. `GET /cycles/:cycleId/report` muestra cada intento y su
+respuesta; los intentos están en `report_attempts`, separados del historial
+de mensajes entrantes. El frontend aún no consume esta ruta.
+
+El envío automático se controla con `REPORTS_ENABLED` (default `false`).
+Además exige `LEDGER_BASELINE_CONFIRMED=true`: esta bandera es una declaración
+del operador después de reconciliar el saldo inicial, no calcula ni importa
+ese saldo. No activar con contabilidad incompleta. El worker bloquea trabajos
+si detecta propuestas/confirmaciones voluntarias en el historial, ya que su
+efecto contable todavía no está implementado.
+
+`/health` incluye `reporter.enabled`, `lastTick` y `lastError`. Una falla o
+un worker habilitado sin actividad por 60 segundos produce HTTP 503. Fallos
+de publicación y estados bloqueados se consultan por la ruta de reportes.

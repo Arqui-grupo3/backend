@@ -146,3 +146,10 @@ Si quantity es negativo, se retira energía y se abona dinero. Se permiten
 saldos negativos; no se genera ni se espera otra transferencia por este
 intercambio. Un estado recibido después de una demanda conserva su efecto.
 Las migraciones se registran en `ledger_migrations` y se ejecutan una vez.
+
+## Extensión: reportes durables
+
+La implementación posterior está descrita en [p3-demand-report.md](p3-demand-report.md).
+Los reportes e intentos salen de una tabla de pendientes separada del ledger.
+La guía de Fase 1 describe su base; actualmente las demandas sí están aplicadas
+y el scheduler de reportes existe, deshabilitado por defecto.

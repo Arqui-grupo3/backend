@@ -25,14 +25,14 @@ async function post(event) {
   const r = await fetch(base + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event) });
   return { status: r.status, body: await r.json() };
 }
-async function startServer() {
+async function startServer(extraEnv = {}) {
   const socket = net.createServer(); socket.listen(0, '127.0.0.1'); await once(socket, 'listening');
   const port = socket.address().port; await new Promise(resolve => socket.close(resolve));
   const url = new URL(process.env.TEST_DATABASE_URL);
   server = spawn(process.execPath, ['index.js'], { cwd: require('node:path').join(__dirname, '..'), env: {
-    ...process.env, NEW_RELIC_ENABLED: 'false', AUTH_REQUIRED: 'false', PORT: String(port),
+    ...process.env, REPORTS_ENABLED: 'false', NEW_RELIC_ENABLED: 'false', AUTH_REQUIRED: 'false', PORT: String(port),
     PGHOST: url.hostname, PGPORT: url.port || '5432', PGUSER: decodeURIComponent(url.username),
-    PGPASSWORD: decodeURIComponent(url.password), PGDATABASE: url.pathname.slice(1), PGOPTIONS: `-c search_path=${schema}`,
+    PGPASSWORD: decodeURIComponent(url.password), PGDATABASE: url.pathname.slice(1), PGOPTIONS: `-c search_path=${schema}`, ...extraEnv,
   }, stdio: ['ignore','pipe','pipe'] });
   server.stdout.on('data', d => logs += d); server.stderr.on('data', d => logs += d);
   base = `http://127.0.0.1:${port}`;
@@ -150,4 +150,47 @@ test('demanda anterior al status se aplica cuando llega el estado; decimales exa
   const state = await getCycleState(pool,'early-demand');
   assert.equal(state.energyBalance,'-19.9');
   assert.equal((await pool.query('SELECT $1::numeric - $2::numeric AS delta',[before.budget_balance,state.budgetBalance])).rows[0].delta,'0.02');
+});
+
+
+test('API + worker + publisher HTTP: opensAt sobrevive al reinicio y conserva identificadores', async t => {
+  const http = require('node:http');
+  const outgoing = []; let corrected;
+  const connector = http.createServer(async (req,res) => {
+    try {
+      let raw='';for await(const chunk of req)raw+=chunk;
+      const envelope=JSON.parse(raw);outgoing.push(envelope);
+      await post(message('ack',envelope.cycleId,{target:envelope.msgId}));
+      if(outgoing.length===1){
+        corrected=new Date(Date.now()+900);
+        await post(message('error',envelope.cycleId,{target:envelope.msgId,message:'early',opensAt:corrected.toISOString()},{reason:'REPORT_TOO_EARLY',code:422}));
+      }
+      res.writeHead(201,{'Content-Type':'application/json'});res.end(JSON.stringify(envelope));
+    }catch(err){res.writeHead(500);res.end(JSON.stringify({error:err.message}));}
+  });
+  connector.listen(0,'127.0.0.1');await once(connector,'listening');
+  t.after(()=>new Promise(resolve=>connector.close(resolve)));
+  const env={REPORTS_ENABLED:'true',LEDGER_BASELINE_CONFIRMED:'true',CONNECTOR_URL:`http://127.0.0.1:${connector.address().port}`};
+  // Remove the deliberately unsupported fixture; it is not part of the ledger.
+  await pool.query("DELETE FROM events WHERE type='give'");
+  await stopServer();await startServer(env);
+  const fresh=status('http-report',{timestamp:new Date().toISOString()});
+  fresh.data.validUntil=new Date(Date.now()+5*60000+300).toISOString();
+  assert.equal((await post(fresh)).status,201);
+  async function until(condition) {
+    for(let i=0;i<100;i++){if(await condition())return;await new Promise(r=>setTimeout(r,30));}
+    assert.fail('No progreso del reporte: '+logs);
+  }
+  await until(async()=>{const r=await fetch(base+'/cycles/http-report/report');return (await r.json()).status==='pending' && outgoing.length===1;});
+  assert.equal(outgoing.length,1);
+  await stopServer();await startServer(env);
+  await until(async()=>{const r=await fetch(base+'/cycles/http-report/report');return (await r.json()).status==='acknowledged';});
+  assert.equal(outgoing.length,2);
+  assert.equal(outgoing[0].idpk,outgoing[1].idpk);assert.notEqual(outgoing[0].msgId,outgoing[1].msgId);
+  assert.ok(Date.parse(outgoing[1].timestamp)>=+corrected);
+  const report=await (await fetch(base+'/cycles/http-report/report')).json();
+  assert.equal(report.attemptCount,2);
+  assert.equal(report.attempts[1].scheduled_at,corrected.toISOString());
+  const health=await (await fetch(base+'/health')).json();assert.equal(health.reporter.enabled,true);
+  await stopServer();await startServer();
 });

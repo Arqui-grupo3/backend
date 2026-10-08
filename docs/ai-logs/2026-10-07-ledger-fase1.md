@@ -19,3 +19,17 @@
 Se implementó la convención de signos de demand-statement con migración
 incremental y pruebas de duplicados, saldo negativo, llegada antes del estado
 y aritmética decimal. Diez pruebas con Postgres real aprobadas. Sin despliegue.
+
+## Continuación autorizada: negotiation-report
+
+- Se añadió aclaración a ADR 0003 antes del código del scheduler.
+- Tabla durable de trabajos e intentos, ventana derivada de validUntil, reloj
+  hasta opensAt, IDs persistidos antes de publicar, ACK/error correlacionados,
+  reintentos limitados y consulta protegida de evidencia.
+- Se extendió el publicador del connector para conservar msgId y timestamp
+  preparados por el backend; sigue adjuntando userId AMQP city.REE.
+- 21 pruebas aprobadas: Postgres real, backend HTTP, scheduler con reloj
+  controlado, publicador con canal AMQP simulado y prueba integrada con
+  endpoint HTTP de publicación simulado, incluyendo reinicio entre intentos.
+- No se contactó al broker real ni se desplegó. Reportes apagados por defecto.
+- Pendientes de negocio: base inicial verificada y negociaciones voluntarias.

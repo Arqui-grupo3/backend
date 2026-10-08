@@ -4,6 +4,12 @@ const express = require('express');
 const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
 const ledger = require('./ledger');
+const reports = require('./reports');
+const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
+if (REPORTS_ENABLED && process.env.LEDGER_BASELINE_CONFIRMED !== 'true') {
+  throw new Error('Reportes requieren LEDGER_BASELINE_CONFIRMED=true tras verificar el saldo inicial.');
+}
+let reportWorker;
 
 const PORT = process.env.PORT || 3000;
 const AUTH_REQUIRED = process.env.AUTH_REQUIRED === 'true';
@@ -143,14 +149,18 @@ async function initDb() {
 app.get('/health', async (req, res) => {
   try {
     const result = await pool.query('SELECT COUNT(*)::int AS count FROM events');
-    res.status(200).json({ status: 'ok', uptime: process.uptime(), count: result.rows[0].count });
+    const reporter = reportWorker?.health || { enabled: false };
+    const reporterHealthy = !reporter.enabled || (!reporter.lastError && Date.now() - Date.parse(reporter.lastTick || reporter.startedAt) < 60000);
+    res.status(reporterHealthy ? 200 : 503).json({ status: reporterHealthy ? 'ok' : 'error', uptime: process.uptime(), count: result.rows[0].count, reporter });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
   }
 });
 
 async function insertEvent(event) {
-  return ledger.recordEvent(pool, event);
+  const result = await ledger.recordEvent(pool, event);
+  reportWorker?.wake();
+  return result;
 }
 
 async function forwardToConnector(path, body) {
@@ -261,6 +271,17 @@ app.post('/events', async (req, res) => {
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el evento' });
+  }
+});
+
+app.get('/cycles/:cycleId/report', authenticate, async (req, res) => {
+  try {
+    const report = await reports.getReport(pool, req.params.cycleId);
+    if (!report) return res.status(404).json({ error: 'Ciclo sin reporte programado' });
+    res.json(report);
+  } catch (err) {
+    console.error('[master] Error al consultar reporte:', err.message);
+    res.status(500).json({ error: 'Error al consultar reporte' });
   }
 });
 
@@ -502,6 +523,15 @@ app.get('/negotiations', authenticate, async (req, res) => {
 });
 
 initDb().then(() => {
+  reportWorker = reports.startWorker(pool, async envelope => {
+    const response = await fetch(`${CONNECTOR_URL}/publish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`Publicacion de reporte: HTTP ${response.status}`);
+    const published = await response.json();
+    if (published.msgId !== envelope.msgId || published.idpk !== envelope.idpk) throw new Error('Connector no preservo IDs del reporte');
+  }, { enabled: REPORTS_ENABLED });
   app.listen(PORT, () => {
     console.log(`[master] Escuchando en http://localhost:${PORT}`);
   });

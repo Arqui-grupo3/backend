@@ -32,6 +32,8 @@ services:
       PGDATABASE: ${POSTGRES_DB:-energyshark}
       NEW_RELIC_APP_NAME: ${NEW_RELIC_APP_NAME:-energyshark-master}
       CONNECTOR_URL: http://connector:3001
+      REPORTS_ENABLED: ${REPORTS_ENABLED:-false}
+      LEDGER_BASELINE_CONFIRMED: ${LEDGER_BASELINE_CONFIRMED:-false}
       AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
       AUTH0_ISSUER: ${AUTH0_ISSUER:-}
       AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:-}

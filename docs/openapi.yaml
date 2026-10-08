@@ -92,6 +92,55 @@ paths:
                 $ref: '#/components/schemas/PaginatedCycles'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /cycles/{cycleId}/report:
+    get:
+      description: >-
+        Trabajo persistido e intentos de negotiation-report. acknowledged solo
+        confirma recepcion; un error posterior de la central puede reprogramarlo.
+        Campos de fecha en UTC. Los envios estan deshabilitados por defecto.
+      parameters:
+        - in: path
+          name: cycleId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Programacion, snapshot enviado e historial de intentos
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cycle_id, idpk, status, due_at, closes_at, attemptCount, attempts]
+                properties:
+                  cycle_id: { type: string }
+                  idpk: { type: string, format: uuid }
+                  status: { type: string, enum: [pending, sending, sent, acknowledged, failed, expired, blocked] }
+                  due_at: { type: string, format: date-time }
+                  closes_at: { type: string, format: date-time }
+                  attemptCount: { type: integer }
+                  last_error: { type: string, nullable: true }
+                  payload: { type: object, nullable: true }
+                  snapshot_seq: { type: string, nullable: true }
+                  attempts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        msg_id: { type: string, format: uuid }
+                        attempt: { type: integer }
+                        envelope: { type: object }
+                        scheduled_at: { type: string, format: date-time }
+                        started_at: { type: string, format: date-time }
+                        published_at: { type: string, format: date-time, nullable: true }
+                        ack_at: { type: string, format: date-time, nullable: true }
+                        error_reason: { type: string, nullable: true }
+                        publish_error: { type: string, nullable: true }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Ciclo sin trabajo programado
+        '500':
+          description: No se pudo consultar el reporte
   /cycles/{cycleId}/ledger:
     get:
       description: >-
