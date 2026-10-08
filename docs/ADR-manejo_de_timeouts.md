@@ -80,3 +80,27 @@ Reglas concretas:
   escala hay que agregar bloqueo a nivel de fila.
 - Quedamos con evidencia persistida de cada reintento, que es lo que se
   muestra en la demo cuando el ayudante reenvía un mensaje duplicado.
+## Implementación del scheduler de reportes
+
+Para reportes se conserva el trabajo pendiente y cada intento en Postgres. La
+ventana inicial se deduce de `status-statement.data.validUntil`: abre cinco
+minutos antes de ese cierre. `REPORT_TOO_EARLY.data.opensAt` reemplaza la hora
+estimada cuando la central la corrige. El worker usa un temporizador hasta la
+fecha persistida, más una reconciliación periódica para reinicios y otros
+procesos; no redondea opensAt al siguiente tick de cinco segundos. El envío
+real está sujeto a latencia del proceso y red: no se promete puntualidad física
+al milisegundo.
+
+Cada intento tiene msgId persistido ANTES de publicar (el connector acepta
+ese identificador interno). Así incluso una respuesta inmediata puede
+correlacionarse. ACK significa recepción, no aceptación final; un error
+posterior para ese intento puede reprogramar el trabajo. Los errores tardíos
+de intentos anteriores no pisan el intento actual. Una pérdida de respuesta
+HTTP reutiliza idpk, con nuevo msgId y el mismo snapshot contable; un rechazo
+explícito REPORT_TOO_EARLY permite tomar un snapshot nuevo al reintentar.
+Máximo: envío inicial más tres reintentos, nunca después del cierre.
+
+El scheduler queda deshabilitado por defecto. Para habilitarlo se requiere
+confirmar explícitamente la base inicial del ledger. No se reportan balances
+con negociaciones voluntarias registradas que esta implementación todavía no
+contabiliza. El historial de intentos es consultable por una ruta protegida.

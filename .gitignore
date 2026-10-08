@@ -16,3 +16,5 @@ node_modules/
 Thumbs.db
 desktop.ini
 
+
+!master/migrations/*.sql

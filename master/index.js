@@ -3,6 +3,15 @@ require('dotenv').config();
 const express = require('express');
 const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
+const ledger = require('./ledger');
+const reports = require('./reports');
+const negotiations = require('./negotiations');
+const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
+if (REPORTS_ENABLED && process.env.LEDGER_BASELINE_CONFIRMED !== 'true') {
+  throw new Error('Reportes requieren LEDGER_BASELINE_CONFIRMED=true tras verificar el saldo inicial.');
+}
+let reportWorker;
+let negotiationWorker;
 
 const PORT = process.env.PORT || 3000;
 const AUTH_REQUIRED = process.env.AUTH_REQUIRED === 'true';
@@ -127,6 +136,7 @@ async function initDb() {
       await pool.query('CREATE INDEX IF NOT EXISTS idx_events_cycle_id ON events (cycle_id);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_received_at ON api_audit (received_at DESC);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_reason ON api_audit (reason);');
+      await ledger.migrate(pool);
       console.log('[master] Conectado a Postgres. Tabla "events" lista.');
       return;
     } catch (err) {
@@ -141,30 +151,22 @@ async function initDb() {
 app.get('/health', async (req, res) => {
   try {
     const result = await pool.query('SELECT COUNT(*)::int AS count FROM events');
-    res.status(200).json({ status: 'ok', uptime: process.uptime(), count: result.rows[0].count });
+    const reporter = reportWorker?.health || { enabled: false };
+    const negotiator = negotiationWorker?.health || { enabled: false };
+    const reporterHealthy = !reporter.enabled || (!reporter.lastError && Date.now() - Date.parse(reporter.lastTick || reporter.startedAt) < 60000);
+    const negotiatorHealthy = !negotiator.enabled || (!negotiator.lastError && Date.now() - Date.parse(negotiator.lastTick || negotiator.startedAt) < 60000);
+    const healthy = reporterHealthy && negotiatorHealthy;
+    res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'error', uptime: process.uptime(), count: result.rows[0].count, reporter, negotiator });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
   }
 });
 
 async function insertEvent(event) {
-  const receivedAt = event.receivedAt || new Date().toISOString();
-  const result = await pool.query(
-    `INSERT INTO events (id, idpk, msg_id, type, cycle_id, package_body, received_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (idpk) DO NOTHING
-     RETURNING id`,
-    [
-      randomUUID(),
-      event.idpk,
-      event.msgId ?? null,
-      event.type,
-      event.cycleId ?? null,
-      event.data ?? {},
-      receivedAt,
-    ]
-  );
-  return { inserted: result.rowCount > 0, id: result.rows[0]?.id || null, receivedAt };
+  const result = await ledger.recordEvent(pool, event);
+  reportWorker?.wake();
+  negotiationWorker?.wake();
+  return result;
 }
 
 async function forwardToConnector(path, body) {
@@ -255,7 +257,7 @@ app.post('/events', async (req, res) => {
     return res.status(400).json({ error: 'Body invalido, se esperaba JSON' });
   }
 
-  const { idpk, msgId, type, data, cycleId, receivedAt } = body;
+  const { idpk, type, receivedAt } = body;
 
   if (!idpk || !type) {
     return res.status(400).json({ error: 'Faltan campos requeridos: idpk, type' });
@@ -267,27 +269,37 @@ app.post('/events', async (req, res) => {
     const result = await insertEvent({ ...body, receivedAt: receivedAtValue });
 
     if (!result.inserted) {
-      await pool.query(
-        `INSERT INTO api_audit (id, idpk, msg_id, type, cycle_id, reason, details, received_at)
-         VALUES ($1, $2, $3, $4, $5, 'DUPLICATE_IDPK', $6, $7)`,
-        [
-          randomUUID(),
-          idpk,
-          UUID_PATTERN.test(String(msgId || '')) ? msgId : null,
-          type,
-          cycleId ?? null,
-          JSON.stringify({ message: 'Evento duplicado; no se reaplico al ledger.' }),
-          result.receivedAt,
-        ]
-      );
       return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk, duplicate: true });
     }
 
     console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);
-    res.status(201).json({ id: result.id });
+    res.status(201).json({ id: result.id, ledgerApplied: result.ledgerApplied });
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
-    res.status(500).json({ error: 'Error interno al guardar el evento' });
+    res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el evento' });
+  }
+});
+
+app.get('/cycles/:cycleId/report', authenticate, async (req, res) => {
+  try {
+    const report = await reports.getReport(pool, req.params.cycleId);
+    if (!report) return res.status(404).json({ error: 'Ciclo sin reporte programado' });
+    res.json(report);
+  } catch (err) {
+    console.error('[master] Error al consultar reporte:', err.message);
+    res.status(500).json({ error: 'Error al consultar reporte' });
+  }
+});
+
+// Projection includes central demands; voluntary negotiations remain pending.
+app.get('/cycles/:cycleId/ledger', authenticate, async (req, res) => {
+  try {
+    const state = await ledger.getCycleState(pool, req.params.cycleId);
+    if (!state) return res.status(404).json({ error: 'Ciclo sin operaciones de ledger' });
+    res.json({ ...state, scope: 'status-transfers-and-demands', historicalBaseline: 'zero-at-ledger-installation' });
+  } catch (err) {
+    console.error('[master] Error al consultar ledger:', err.message);
+    res.status(500).json({ error: 'Error al consultar ledger' });
   }
 });
 
@@ -349,24 +361,13 @@ app.get('/cycles/:cycleId', authenticate, async (req, res) => {
 
 app.post('/negotiations', authenticate, async (req, res) => {
   const { cycleId, direction, quantity, pricePerEnergy } = req.body || {};
-  if (!cycleId || !['give', 'take'].includes(direction) ||
-      !Number.isFinite(quantity) || quantity <= 0 ||
-      !Number.isFinite(pricePerEnergy) || pricePerEnergy < 0) {
-    return res.status(400).json({ error: 'cycleId, direction, quantity y pricePerEnergy invalidos' });
-  }
-  const event = {
-    idpk: randomUUID(),
-    type: 'negotiation-proposal',
-    cycleId,
-    data: { direction, quantity, pricePerEnergy },
-  };
   try {
-    const message = await forwardToConnector('/publish', event);
-    const stored = await insertEvent({ ...message, receivedAt: new Date().toISOString() });
-    return res.status(201).json({ ...message, eventId: stored.id, status: 'pending' });
+    const job = await negotiations.createProposal(pool, { cycleId, direction, quantity, pricePerEnergy });
+    negotiationWorker?.wake();
+    return res.status(201).json(job);
   } catch (err) {
-    console.error('[master] Error al publicar propuesta:', err.message);
-    return res.status(err.statusCode || 502).json({ error: 'No se pudo publicar la propuesta' });
+    console.error('[master] Error al crear propuesta:', err.message);
+    return res.status(400).json({ error: err.message });
   }
 });
 
@@ -465,51 +466,12 @@ app.get('/connectivity', authenticate, async (req, res) => {
 });
 
 app.get('/negotiations', authenticate, async (req, res) => {
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
   try {
-    const result = await pool.query(
-      `SELECT id, idpk, msg_id AS "msgId", cycle_id AS "cycleId", type,
-              package_body AS data, received_at AS "receivedAt",
-              CASE type
-                WHEN 'negotiation-proposal' THEN CASE
-                  WHEN EXISTS (
-                    SELECT 1 FROM events confirmation
-                    WHERE confirmation.type IN ('give', 'take')
-                      AND confirmation.package_body->>'target' = events.msg_id::text
-                  ) AND EXISTS (
-                    SELECT 1 FROM events payment
-                    WHERE payment.type = 'transfer'
-                      AND payment.package_body->>'becauseOf' IN (
-                        SELECT confirmation.msg_id::text FROM events confirmation
-                        WHERE confirmation.type IN ('give', 'take')
-                          AND confirmation.package_body->>'target' = events.msg_id::text
-                      )
-                  ) THEN 'paid'
-                  WHEN EXISTS (
-                    SELECT 1 FROM events confirmation
-                    WHERE confirmation.type IN ('give', 'take')
-                      AND confirmation.package_body->>'target' = events.msg_id::text
-                  ) THEN 'confirmed'
-                  WHEN EXISTS (
-                    SELECT 1 FROM events failure
-                    WHERE failure.type = 'error'
-                      AND failure.package_body->>'target' = events.msg_id::text
-                  ) THEN 'expired'
-                  ELSE 'pending'
-                END
-                WHEN 'give' THEN 'confirmed'
-                WHEN 'take' THEN 'confirmed'
-                WHEN 'transfer' THEN 'paid'
-                WHEN 'error' THEN 'failed'
-                ELSE 'unknown'
-              END AS status
-       FROM events
-       WHERE type IN ('negotiation-proposal', 'give', 'take', 'transfer', 'negotiation-report', 'error')
-       ORDER BY seq DESC
-       LIMIT $1`,
-      [limit]
-    );
-    res.json({ data: result.rows });
+    const data = await negotiations.getNegotiations(pool, {
+      cycleId: req.query.cycleId,
+      limit: req.query.limit,
+    });
+    res.json({ data });
   } catch (err) {
     console.error('[master] Error al consultar /negotiations:', err.message);
     res.status(500).json({ error: 'Error interno al consultar negociaciones' });
@@ -517,6 +479,26 @@ app.get('/negotiations', authenticate, async (req, res) => {
 });
 
 initDb().then(() => {
+  reportWorker = reports.startWorker(pool, async envelope => {
+    const response = await fetch(`${CONNECTOR_URL}/publish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`Publicacion de reporte: HTTP ${response.status}`);
+    const published = await response.json();
+    if (published.msgId !== envelope.msgId || published.idpk !== envelope.idpk) throw new Error('Connector no preservo IDs del reporte');
+  }, { enabled: REPORTS_ENABLED });
+
+  negotiationWorker = negotiations.startWorker(pool, async envelope => {
+    const response = await fetch(`${CONNECTOR_URL}/publish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`Publicacion de negociacion: HTTP ${response.status}`);
+    const published = await response.json();
+    if (published.msgId !== envelope.msgId || published.idpk !== envelope.idpk) throw new Error('Connector no preservo IDs de la negociacion');
+  }, { enabled: true });
+
   app.listen(PORT, () => {
     console.log(`[master] Escuchando en http://localhost:${PORT}`);
   });

@@ -1,5 +1,5 @@
 const { randomUUID } = require('node:crypto');
-const { isUuid, validateContent } = require('./content-validation');
+const { isUuid, isTimestamp, validateContent } = require('./content-validation');
 
 async function createPublisher(connection) {
   const channel = await connection.createConfirmChannel();
@@ -8,7 +8,7 @@ async function createPublisher(connection) {
   });
 
   return async function publishMessage(
-    { type, data = {}, idpk = randomUUID(), cycleId, reason, code },
+    { type, data = {}, idpk = randomUUID(), msgId = randomUUID(), timestamp = new Date().toISOString(), cycleId, reason, code },
     routingKey = 'central'
   ) {
     if (typeof type !== 'string' || !type.trim()) {
@@ -21,11 +21,14 @@ async function createPublisher(connection) {
       throw new Error('La publicacion requiere un idpk UUID valido.');
     }
 
+    if (!isUuid(msgId) || msgId.toLowerCase() === idpk.toLowerCase()) throw new Error('msgId debe ser un UUID distinto de idpk.');
+    if (!isTimestamp(timestamp)) throw new Error('timestamp invalido.');
+
     const message = {
       idpk,
-      msgId: randomUUID(),
+      msgId,
       type,
-      timestamp: new Date().toISOString(),
+      timestamp,
       cityId: 'REE',
       data,
     };
@@ -33,7 +36,6 @@ async function createPublisher(connection) {
     if (reason !== undefined) message.reason = reason;
     if (code !== undefined) message.code = code;
 
-    while (message.msgId.toLowerCase() === idpk.toLowerCase()) message.msgId = randomUUID();
     const invalid = validateContent(message);
     if (invalid) throw new Error(`${invalid.reason}: ${invalid.message}`);
 
