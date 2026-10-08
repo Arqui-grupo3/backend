@@ -12,6 +12,7 @@ La documentación sigue un esquema modular por integrante y responsabilidad téc
 | :--- | :--- | :--- | :--- | :--- |
 | **P2** | Juan Garrido | Protocolo AMQP v2, contratos JSON Schema, broker RabbitMQ, despliegue base y persistencia PostgreSQL. | Codex | [Ver logs P2](P2/README.md) |
 | **P3** | Pedro | Ledger inmutable append-only, demandas de central, negociaciones voluntarias (take/give ≤30s), liquidación contable y scheduler durable de reportes. | Codex / Antigravity | [Ver logs P3](P3/README.md) |
+| **P4** | Matías Santos | Endpoints de consulta API REST (RF01, RF02, RF04, RF05), auditoría y filtros de historial. | Cursor / ChatGPT | [Ver logs P4](log-conversacion-P4.md) |
 | **P5** | Pedro | Scaffold en React/Vite, sistema de diseño "Océano Eléctrico", autenticación y vistas de producción (RF01, RF02, RF04, RF05). | Antigravity | [Ver logs P5](P5/README.md) |
 
 ---
