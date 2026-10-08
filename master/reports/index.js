@@ -69,8 +69,17 @@ async function claim(pool, now) {
     }
     if (!job.payload) {
       const state = await getCycleState(client,job.cycle_id);
-      // Partial accounting must not silently report negotiated balances.
-      const unsupported = await client.query("SELECT 1 FROM events WHERE type IN ('negotiation-proposal','give','take') LIMIT 1");
+      // Partial or in-flight negotiations must not silently report partial balances.
+      const unsupported = await client.query(`
+        SELECT 1 FROM events e
+        WHERE e.type IN ('negotiation-proposal','give','take')
+          AND NOT EXISTS (
+            SELECT 1 FROM negotiation_jobs j
+            WHERE (j.last_msg_id = e.msg_id OR j.confirmation_msg_id = e.msg_id)
+              AND j.status IN ('paid', 'failed', 'expired')
+          )
+        LIMIT 1
+      `);
       if (!state?.initialized || unsupported.rowCount) {
         await client.query("UPDATE report_jobs SET status='blocked',last_error=$2,updated_at=$3 WHERE cycle_id=$1",
           [job.cycle_id,unsupported.rowCount ? 'Voluntary negotiations not accounted for' : 'Missing status-statement',now]);

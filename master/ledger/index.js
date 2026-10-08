@@ -16,13 +16,17 @@ function validate(event) {
   if (!ledgerTypes.has(event.type)) return;
   if (!uuid.test(event.idpk) || !uuid.test(event.msgId || '') || event.idpk.toLowerCase() === event.msgId.toLowerCase()) fail('idpk y msgId deben ser UUID distintos.');
   if (!timestamp(event.timestamp) || typeof event.cycleId !== 'string' || !event.cycleId.trim()) fail('timestamp y cycleId requeridos.');
-  if (event.sender !== 'central' || !object(event.data)) fail('Se requiere sender central y data.');
+  if ((event.sender !== 'central' && event.cityId !== 'REE') || !object(event.data)) fail('Se requiere sender central o cityId REE y data.');
   if (event.type === 'transfer') {
     if (!Number.isFinite(event.data.quantity)) fail('quantity debe ser un numero finito.');
     if ('becauseOf' in event.data && !uuid.test(event.data.becauseOf)) fail('becauseOf debe ser UUID.');
   } else if (event.type === 'demand-statement') {
     const balance = event.data.balance;
     if (!object(balance) || !Number.isFinite(balance.quantity) || !Number.isFinite(balance.valuePerKwh) || balance.valuePerKwh < 0) fail('balance requiere quantity finito y valuePerKwh no negativo.');
+  } else if (event.type === 'give' || event.type === 'take') {
+    if (!Number.isFinite(event.data.energy) || event.data.energy <= 0) fail('energy debe ser positivo.');
+    if (!Number.isFinite(event.data.pricePerEnergy) || event.data.pricePerEnergy < 0) fail('pricePerEnergy debe ser no negativo.');
+    if ('target' in event.data && !uuid.test(event.data.target)) fail('target debe ser UUID.');
   } else {
     const energy = event.data.energy;
     if (!object(energy) || ['generationCapacity', 'consumption', 'generationCost'].some(k => !Number.isFinite(energy[k]) || energy[k] < 0)) fail('Estado energetico invalido.');
@@ -36,7 +40,7 @@ async function migrate(pool) {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(2173, 1)');
     await client.query('CREATE TABLE IF NOT EXISTS ledger_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())');
-    for (const name of ['001-ledger.sql', '002-demand.sql', '003-reports.sql']) {
+    for (const name of ['001-ledger.sql', '002-demand.sql', '003-reports.sql', '004-negotiations.sql']) {
       const applied = await client.query('SELECT 1 FROM ledger_migrations WHERE name=$1', [name]);
       if (!applied.rowCount) {
         await client.query(readFileSync(join(__dirname, '../migrations', name), 'utf8'));
@@ -77,6 +81,7 @@ async function recordEvent(pool, event) {
       [id,idpk,event.msgId,event.cycleId,event.type,event.data,event,event.timestamp]);
     }
     await require('../reports').onEvent(client, event);
+    await require('../negotiations').onEvent(client, event);
     await client.query('COMMIT');
     return { inserted: true, id, receivedAt, ledgerApplied: ledgerTypes.has(event.type) };
   } catch (err) { await client.query('ROLLBACK'); throw err; }
