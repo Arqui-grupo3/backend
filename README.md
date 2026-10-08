@@ -112,33 +112,6 @@ docker compose down
 
 ---
 
-## Trabajar sin el broker
-
-Si solo estás tocando la API y no quieres conectarte al broker del curso,
-levanta únicamente lo que necesitas:
-
-```bash
-docker compose up db master
-```
-
-Y mete eventos a mano por la misma ruta que usa el connector:
-
-```bash
-curl -X POST http://localhost:3000/events \
-  -H "Content-Type: application/json" \
-  -d '{
-    "idpk": "prueba-001",
-    "msgId": "11111111-1111-1111-1111-111111111111",
-    "type": "status-statement",
-    "timestamp": "2026-10-07T12:00:00Z",
-    "data": {}
-  }'
-```
-
-Mandar dos veces el mismo `idpk` es la forma rápida de comprobar la
-idempotencia: la segunda vez no debe producir efecto sobre el ledger.
-
----
 
 ## Estructura
 
