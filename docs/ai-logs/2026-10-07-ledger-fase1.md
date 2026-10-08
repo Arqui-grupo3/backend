@@ -33,3 +33,19 @@ y aritmética decimal. Diez pruebas con Postgres real aprobadas. Sin despliegue.
   endpoint HTTP de publicación simulado, incluyendo reinicio entre intentos.
 - No se contactó al broker real ni se desplegó. Reportes apagados por defecto.
 - Pendientes de negocio: base inicial verificada y negociaciones voluntarias.
+
+## Continuación autorizada: negociaciones voluntarias (P3 - M2)
+
+- Asistente: Antigravity.
+- Alcance: Flujo voluntario completo de negociación (`proposal` -> `confirmación` en <=30s -> `pago` en <=30s -> reintento con el mismo `idpk`).
+- Migración `004-negotiations.sql`: tablas `negotiation_jobs` y `negotiation_attempts`, extensión de `ledger_events` (`give`, `take`) y actualización de la vista contable `cycle_state`.
+- Motor durable `master/negotiations/index.js`:
+  - Timeouts de 30s con reintento manteniendo el mismo `idpk` y generando un nuevo `msgId` aleatorio.
+  - Tope de hasta 3 reintentos (4 intentos en total); expiración automática.
+  - Flujo `take`: confirmación genera pago saliente (`transfer`) descontando fondos del presupuesto y sumando energía al ledger.
+  - Flujo `give`: confirmación espera pago de la central hasta 30s; si vence, reintenta propuesta con el mismo `idpk` sin alterar el ledger; si llega el pago, liquida fondos y descuenta energía.
+  - Manejo de respuestas de error de la central: `PRICE_ABOVE_CAP` (guarda `data.cap`) y `OVER_CAPACITY` (guarda `data.spare`).
+  - Desbloqueo del snapshot de `negotiation-report` una vez que las negociaciones del ciclo quedan liquidadas.
+- Endpoints actualizados en `master/index.js`: `POST /negotiations` crea trabajos persistentes y `GET /negotiations` consulta el estado durable.
+- Verificación: 28 pruebas automatizadas aprobadas (21 heredadas + 7 nuevas de negociación voluntaria) con PostgreSQL real.
+
