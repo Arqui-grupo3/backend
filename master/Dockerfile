@@ -10,6 +10,7 @@ RUN npm ci --omit=dev
 COPY index.js ./
 COPY ledger/ ./ledger/
 COPY reports/ ./reports/
+COPY negotiations/ ./negotiations/
 COPY migrations/ ./migrations/
 
 ENV PORT=3000
