@@ -13,3 +13,9 @@
   Fase 2, sin cambios frontend/Auth0/Gateway, sin merge ni deploy.
 - Verificación: servidor HTTP real y PostgreSQL 16 temporal local; Docker no
   estaba ejecutándose, por lo que no se verificó la construcción de la imagen.
+
+## Continuación autorizada: demandas
+
+Se implementó la convención de signos de demand-statement con migración
+incremental y pruebas de duplicados, saldo negativo, llegada antes del estado
+y aritmética decimal. Diez pruebas con Postgres real aprobadas. Sin despliegue.

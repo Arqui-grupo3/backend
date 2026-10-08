@@ -264,12 +264,12 @@ app.post('/events', async (req, res) => {
   }
 });
 
-// Phase 1 projection; not final RF03 balances (demand/negotiations pending).
+// Projection includes central demands; voluntary negotiations remain pending.
 app.get('/cycles/:cycleId/ledger', authenticate, async (req, res) => {
   try {
     const state = await ledger.getCycleState(pool, req.params.cycleId);
     if (!state) return res.status(404).json({ error: 'Ciclo sin operaciones de ledger' });
-    res.json({ ...state, scope: 'phase1-status-and-incoming-transfers', historicalBaseline: 'zero-at-ledger-installation' });
+    res.json({ ...state, scope: 'status-transfers-and-demands', historicalBaseline: 'zero-at-ledger-installation' });
   } catch (err) {
     console.error('[master] Error al consultar ledger:', err.message);
     res.status(500).json({ error: 'Error al consultar ledger' });

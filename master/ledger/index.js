@@ -1,7 +1,7 @@
 const { randomUUID } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
-const ledgerTypes = new Set(['status-statement', 'transfer']);
+const ledgerTypes = new Set(['status-statement', 'transfer', 'demand-statement']);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
 const timestamp = x => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(x) &&
@@ -20,6 +20,9 @@ function validate(event) {
   if (event.type === 'transfer') {
     if (!Number.isFinite(event.data.quantity)) fail('quantity debe ser un numero finito.');
     if ('becauseOf' in event.data && !uuid.test(event.data.becauseOf)) fail('becauseOf debe ser UUID.');
+  } else if (event.type === 'demand-statement') {
+    const balance = event.data.balance;
+    if (!object(balance) || !Number.isFinite(balance.quantity) || !Number.isFinite(balance.valuePerKwh) || balance.valuePerKwh < 0) fail('balance requiere quantity finito y valuePerKwh no negativo.');
   } else {
     const energy = event.data.energy;
     if (!object(energy) || ['generationCapacity', 'consumption', 'generationCost'].some(k => !Number.isFinite(energy[k]) || energy[k] < 0)) fail('Estado energetico invalido.');
@@ -32,7 +35,14 @@ async function migrate(pool) {
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(2173, 1)');
-    await client.query(readFileSync(join(__dirname, '../migrations/001-ledger.sql'), 'utf8'));
+    await client.query('CREATE TABLE IF NOT EXISTS ledger_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())');
+    for (const name of ['001-ledger.sql', '002-demand.sql']) {
+      const applied = await client.query('SELECT 1 FROM ledger_migrations WHERE name=$1', [name]);
+      if (!applied.rowCount) {
+        await client.query(readFileSync(join(__dirname, '../migrations', name), 'utf8'));
+        await client.query('INSERT INTO ledger_migrations(name) VALUES ($1)', [name]);
+      }
+    }
     await client.query('COMMIT');
   } catch (err) { await client.query('ROLLBACK'); throw err; }
   finally { client.release(); }

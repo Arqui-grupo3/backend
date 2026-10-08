@@ -95,8 +95,8 @@ paths:
   /cycles/{cycleId}/ledger:
     get:
       description: >-
-        Proyeccion de Fase 1 (status-statement y transfer recibidos), desde la
-        instalacion del ledger con base cero. No incluye demandas ni negociaciones.
+        Proyeccion de status-statement, transfer recibidos y demand-statement, desde la
+        instalacion del ledger con base cero. No incluye negociaciones voluntarias.
         budgetBalance es el saldo global observado en asOfSequence, no un saldo
         de cierre; energyBalance es propio del ciclo. Importes decimales como strings.
       parameters:
@@ -125,7 +125,7 @@ paths:
                   lastOperationId: { type: string, format: uuid }
                   lastOperationType: { type: string }
                   lastOperationAt: { type: string, format: date-time }
-                  scope: { type: string, enum: [phase1-status-and-incoming-transfers] }
+                  scope: { type: string, enum: [status-transfers-and-demands] }
                   historicalBaseline: { type: string, enum: [zero-at-ledger-installation] }
         '401':
           $ref: '#/components/responses/Unauthorized'

@@ -23,13 +23,13 @@ Ejemplo desde una instalación sin saldo inicial:
 Se implementa la alternativa B de ADR 0002: event log append-only con estado
 reconstruido. No hay una tabla de saldos actualizada por separado.
 
-Solo se aplican `status-statement` y `transfer` entrantes desde `sender: central`.
+Se aplican `status-statement`, `transfer` y `demand-statement` entrantes desde `sender: central`.
 `quantity` se suma con su signo, tal como permite el contrato. Se conserva
 `becauseOf` para trazabilidad; validar el pago contra confirmaciones, descontar
 pagos salientes y coordinar timeouts corresponde al flujo de negociación de
 Fase 2. No se asume que una transferencia entrante sea un pago saliente.
 
-`demand-statement`, propuestas, confirmaciones y reportes siguen conservándose
+Propuestas, confirmaciones y reportes siguen conservándose
 por el código de P4, pero NO se aplican al ledger en esta entrega. Por eso la
 respuesta identifica explícitamente su alcance parcial.
 
@@ -43,13 +43,13 @@ respuesta identifica explícitamente su alcance parcial.
 
 Por cada recepción:
 
-1. Se validan los campos contables y el envelope de los dos tipos soportados.
+1. Se validan los campos contables y el envelope de los tres tipos soportados.
 2. Se abre una transacción y se adquiere un bloqueo transaccional compartido
    por todos los escritores de este servicio. Así se obtiene un orden estable
    de aplicación incluso si llegan varias peticiones simultáneas.
 3. Si ya existe el `idpk`, se registra la entrega duplicada en `api_audit` y se
    responde 200. UUIDs con mayúsculas y minúsculas representan la misma operación.
-4. Si es nuevo, se guarda `events` (historial de P4/E0) y, para los dos tipos
+4. Si es nuevo, se guarda `events` (historial de P4/E0) y, para los tres tipos
    soportados, `ledger_events` (operación contable con envelope completo).
 5. Se hace COMMIT antes de devolver 201. Si falla cualquiera de las escrituras,
    se hace ROLLBACK y se devuelve un error: el connector puede reintentar.
@@ -104,7 +104,7 @@ Ejemplo simplificado:
   "energyBalance": "-20",
   "budgetBalance": "500",
   "asOfSequence": "2",
-  "scope": "phase1-status-and-incoming-transfers",
+  "scope": "status-transfers-and-demands",
   "historicalBaseline": "zero-at-ledger-installation"
 }
 ```
@@ -137,3 +137,12 @@ decimal, ocho duplicados concurrentes, transfer antes de status, ciclos
 solapados, estado antiguo tardío, rollback ante fallo de escritura, rechazo de
 payload inválido, historial de tipos todavía no aplicados, inmutabilidad y
 reconstrucción después de reiniciar el servidor y reconectar a la base.
+
+## Extensión: demand-statement
+
+La migración `002-demand.sql` agrega las demandas al mismo registro inmutable.
+La fórmula es energía += quantity y presupuesto -= quantity * valuePerKwh.
+Si quantity es negativo, se retira energía y se abona dinero. Se permiten
+saldos negativos; no se genera ni se espera otra transferencia por este
+intercambio. Un estado recibido después de una demanda conserva su efecto.
+Las migraciones se registran en `ledger_migrations` y se ejecutan una vez.

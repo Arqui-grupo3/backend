@@ -66,7 +66,7 @@ test('HTTP aplica estado y fondos; usa numeric exacto y expone proyeccion', asyn
   const r = await fetch(base + '/cycles/alpha/ledger'); assert.equal(r.status,200);
   const state = await r.json(); assert.equal(state.energyBalance,'-20'); assert.equal(state.budgetBalance,'0.3');
   assert.equal(state.initialized,true); assert.equal(state.lastOperationType,'transfer');
-  assert.equal(state.scope,'phase1-status-and-incoming-transfers');
+  assert.equal(state.scope,'status-transfers-and-demands');
 });
 test('duplicados concurrentes e idpk en mayusculas no vuelven a abonar', async () => {
   const e = message('transfer','alpha',{quantity:10});
@@ -106,7 +106,7 @@ test('fallo entre historial y ledger revierte ambas escrituras; reintento funcio
 test('payload invalido no altera tablas; otros tipos se preservan sin efecto contable', async () => {
   const e = status('invalid'); e.data.energy.consumption=-1;
   assert.equal((await post(e)).status,422); assert.equal(await getCycleState(pool,'invalid'),null);
-  const other = message('demand-statement','phase2',{balance:{quantity:10,valuePerKwh:3}});
+  const other = message('give','phase2',{target:randomUUID(),energy:10,pricePerEnergy:3});
   const r = await post(other); assert.equal(r.status,201); assert.equal(r.body.ledgerApplied,false);
   assert.equal(await getCycleState(pool,'phase2'),null);
   assert.equal((await fetch(base + '/cycles/phase2/ledger')).status,404);
@@ -120,4 +120,34 @@ test('event log impide update/delete/truncate y reinicio reconstruye el mismo es
   assert.deepEqual(await getCycleState(pool,'alpha'),before);
   const newPool = new Pool({ connectionString:process.env.TEST_DATABASE_URL,options:`-c search_path=${schema}` });
   try { assert.deepEqual(await getCycleState(newPool,'alpha'),before); } finally { await newPool.end(); }
+});
+
+
+test('demand aplica ambos signos sin transfer adicional, acepta saldo negativo e ignora duplicados', async () => {
+  await post(status('demand'));
+  const initial = await getCycleState(pool, 'demand');
+  const incoming = message('demand-statement','demand',{balance:{quantity:30,valuePerKwh:2}});
+  const results = await Promise.all([post(incoming),post({...incoming,msgId:randomUUID()})]);
+  assert.deepEqual(results.map(r=>r.status).sort(),[200,201]);
+  let state = await getCycleState(pool,'demand');
+  assert.equal(state.energyBalance,'10');
+  assert.equal(Number(state.budgetBalance),Number(initial.budgetBalance)-60);
+  await post(message('demand-statement','demand',{balance:{quantity:-5,valuePerKwh:3}}));
+  state = await getCycleState(pool,'demand');
+  assert.equal(state.energyBalance,'5');
+  assert.equal(Number(state.budgetBalance),Number(initial.budgetBalance)-45);
+  assert.ok(Number(state.budgetBalance)<0);
+  // A refreshed status does not erase previous exchanges.
+  await post(status('demand'));
+  assert.equal((await getCycleState(pool,'demand')).energyBalance,'5');
+  assert.equal((await post(message('demand-statement','demand',{balance:{quantity:5,valuePerKwh:-1}}))).status,422);
+});
+test('demanda anterior al status se aplica cuando llega el estado; decimales exactos', async () => {
+  const before = (await pool.query('SELECT budget_balance FROM cycle_state ORDER BY last_operation_seq DESC LIMIT 1')).rows[0];
+  await post(message('demand-statement','early-demand',{balance:{quantity:0.1,valuePerKwh:0.2}}));
+  assert.equal((await getCycleState(pool,'early-demand')).energyBalance,null);
+  await post(status('early-demand'));
+  const state = await getCycleState(pool,'early-demand');
+  assert.equal(state.energyBalance,'-19.9');
+  assert.equal((await pool.query('SELECT $1::numeric - $2::numeric AS delta',[before.budget_balance,state.budgetBalance])).rows[0].delta,'0.02');
 });
