@@ -119,6 +119,8 @@ async function initDb() {
           seq BIGSERIAL
         );
       `);
+      await pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS cycle_id TEXT;');
+      await pool.query('ALTER TABLE events ADD COLUMN IF NOT EXISTS msg_id UUID;');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_events_seq ON events (seq);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_events_cycle_id ON events (cycle_id);');
 
