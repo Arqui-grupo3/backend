@@ -1,5 +1,6 @@
 require('dotenv').config();
 const amqp = require('amqplib');
+const http = require('node:http');
 const { createPublisher } = require('./publisher');
 const { validateEnvelope } = require('./validation');
 const RESPONSE_TYPES = new Set(['ack', 'nack', 'error']);
@@ -14,6 +15,7 @@ const {
   RABBIT_QUEUE,
   MASTER_URL = 'http://localhost:3000/events',
   AUDIT_URL = new URL('audit', MASTER_URL).toString(),
+  CONNECTOR_CONTROL_PORT = '3001',
 } = process.env;
 
 if (!RABBIT_URL && (!RABBIT_USER || !RABBIT_PASS)) {
@@ -95,6 +97,36 @@ async function main() {
   await channel.prefetch(1);
   const publishMessage = await createPublisher(connection);
 
+  // Servidor de control para publicar desde la API (introducido en rama main)
+  const controlServer = http.createServer(async (req, res) => {
+    if (req.method !== 'POST' || req.url !== '/publish') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Ruta no encontrada' }));
+      return;
+    }
+    try {
+      let raw = '';
+      for await (const chunk of req) raw += chunk;
+      const body = JSON.parse(raw);
+      const message = await publishMessage(body);
+      res.writeHead(201, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(message));
+    } catch (err) {
+      console.error('[connector] Error publicando desde API:', err.message);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  });
+  controlServer.listen(CONNECTOR_CONTROL_PORT, () => {
+    console.log(`[connector] API interna de publicación en ${CONNECTOR_CONTROL_PORT}`);
+  });
+  controlServer.on('error', (err) => {
+    if (err.code !== 'EADDRINUSE') console.error('[connector] Error en API interna:', err.message);
+  });
+  connection.on('close', () => {
+    controlServer.close();
+  });
+
   console.log(`[connector] Escuchando la cola "${RABBIT_QUEUE}"...`);
 
   channel.consume(
@@ -105,6 +137,7 @@ async function main() {
       const receivedAt = new Date().toISOString();
       const raw = msg.content.toString('utf8');
       const routingKey = msg.fields?.routingKey;
+      
       if (!['city.REE', 'city.broadcast'].includes(routingKey)) {
         const detail = `Routing key inesperada: ${JSON.stringify(routingKey)}`;
         console.error(`[connector] ${detail}`);
@@ -194,7 +227,6 @@ async function main() {
 
         channel.ack(msg);
       } catch (err) {
-
         console.error('[connector] No se pudo procesar el mensaje o publicar su respuesta, se reencola:', err.message);
 
         await sleep(MASTER_RETRY_DELAY_MS);

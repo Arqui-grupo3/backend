@@ -1,0 +1,196 @@
+const { test, before, after } = require('node:test');
+const assert = require('node:assert/strict');
+const { randomUUID } = require('node:crypto');
+const { spawn } = require('node:child_process');
+const { once } = require('node:events');
+const net = require('node:net');
+const { Pool } = require('pg');
+const { migrate, getCycleState } = require('../ledger');
+
+// Explicit test URL mandatory: never fall back to the application's database.
+if (!process.env.TEST_DATABASE_URL) throw Error('Define TEST_DATABASE_URL para una base Postgres de pruebas.');
+const schema = 'ledger_test_' + randomUUID().replaceAll('-', '');
+const admin = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL, options: `-c search_path=${schema}` });
+let server, base, logs = '';
+const message = (type, cycleId, data, extra = {}) => ({
+  idpk: randomUUID(), msgId: randomUUID(), type, cycleId, sender: 'central',
+  timestamp: '2026-10-07T12:00:00Z', data, ...extra,
+});
+const status = (cycle, extra = {}) => message('status-statement', cycle, {
+  energy: { generationCapacity: 100, consumption: 120, generationCost: 2.5 },
+  validUntil: '2026-10-07T12:20:00Z',
+}, extra);
+async function post(event) {
+  const r = await fetch(base + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event) });
+  return { status: r.status, body: await r.json() };
+}
+async function startServer(extraEnv = {}) {
+  const socket = net.createServer(); socket.listen(0, '127.0.0.1'); await once(socket, 'listening');
+  const port = socket.address().port; await new Promise(resolve => socket.close(resolve));
+  const url = new URL(process.env.TEST_DATABASE_URL);
+  server = spawn(process.execPath, ['index.js'], { cwd: require('node:path').join(__dirname, '..'), env: {
+    ...process.env, REPORTS_ENABLED: 'false', NEW_RELIC_ENABLED: 'false', AUTH_REQUIRED: 'false', PORT: String(port),
+    PGHOST: url.hostname, PGPORT: url.port || '5432', PGUSER: decodeURIComponent(url.username),
+    PGPASSWORD: decodeURIComponent(url.password), PGDATABASE: url.pathname.slice(1), PGOPTIONS: `-c search_path=${schema}`, ...extraEnv,
+  }, stdio: ['ignore','pipe','pipe'] });
+  server.stdout.on('data', d => logs += d); server.stderr.on('data', d => logs += d);
+  base = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(base + '/health')).ok) return; } catch {}
+    if (server.exitCode !== null) throw Error(logs);
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw Error('El servidor no inicio: ' + logs);
+}
+async function stopServer() {
+  if (server && server.exitCode === null) { const exited = once(server, 'exit'); server.kill(); await exited; }
+}
+before(async () => {
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  // Simulate the existing E0 table and a historical record before migration.
+  await pool.query(`CREATE TABLE events (id UUID PRIMARY KEY,idpk TEXT UNIQUE NOT NULL,type TEXT NOT NULL,
+    package_body JSONB,received_at TIMESTAMPTZ NOT NULL,seq BIGSERIAL)`);
+  await pool.query(`INSERT INTO events VALUES ($1,'legacy','legacy',$2,now(),DEFAULT)`, [randomUUID(), { preserved: true }]);
+  await startServer();
+});
+after(async () => { await stopServer(); await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end(); });
+
+test('migracion aditiva e idempotente conserva E0', async () => {
+  await migrate(pool);
+  assert.deepEqual((await pool.query("SELECT package_body FROM events WHERE idpk='legacy'")).rows[0].package_body, { preserved: true });
+});
+test('HTTP aplica estado y fondos; usa numeric exacto y expone proyeccion', async () => {
+  assert.equal((await post(status('alpha'))).status, 201);
+  for (const quantity of [0.1, 0.2]) assert.equal((await post(message('transfer','alpha',{quantity}))).status,201);
+  const r = await fetch(base + '/cycles/alpha/ledger'); assert.equal(r.status,200);
+  const state = await r.json(); assert.equal(state.energyBalance,'-20'); assert.equal(state.budgetBalance,'0.3');
+  assert.equal(state.initialized,true); assert.equal(state.lastOperationType,'transfer');
+  assert.equal(state.scope,'status-transfers-and-demands');
+});
+test('duplicados concurrentes e idpk en mayusculas no vuelven a abonar', async () => {
+  const e = message('transfer','alpha',{quantity:10});
+  const results = await Promise.all(Array.from({length:8},(_,i) => post({...e,idpk:i%2 ? e.idpk.toUpperCase():e.idpk,msgId:randomUUID()})));
+  assert.equal(results.filter(r=>r.status===201).length,1);
+  assert.equal(results.filter(r=>r.status===200 && r.body.duplicate).length,7);
+  assert.equal((await getCycleState(pool,'alpha')).budgetBalance,'10.3');
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM api_audit WHERE idpk=$1',[e.idpk])).rows[0].n,7);
+});
+test('transfer antes del estado, carry-over y ciclos solapados con IDs opacos', async () => {
+  await post(message('transfer','z-next',{quantity:5}));
+  let state = await getCycleState(pool,'z-next'); assert.equal(state.initialized,false); assert.equal(state.energyBalance,null);
+  assert.equal(state.budgetBalance,'15.3');
+  await post(status('z-next'));
+  await post(message('transfer','alpha',{quantity:-2}));
+  assert.equal((await getCycleState(pool,'alpha')).budgetBalance,'13.3');
+  // Historical observation is stable when a different cycle gets an event.
+  assert.equal((await getCycleState(pool,'z-next')).budgetBalance,'15.3');
+  await post(status('z-next'));
+  state = await getCycleState(pool,'z-next'); assert.equal(state.budgetBalance,'13.3'); assert.equal(state.energyBalance,'-20');
+});
+test('estado anterior recibido tarde no reemplaza al mas reciente ni suma energia dos veces', async () => {
+  const older = status('z-next',{timestamp:'2026-10-07T11:00:00Z'}); older.data.energy.generationCapacity=999;
+  await post(older); assert.equal((await getCycleState(pool,'z-next')).energyBalance,'-20');
+});
+test('fallo entre historial y ledger revierte ambas escrituras; reintento funciona', async () => {
+  const e = message('transfer','rollback',{quantity:7});
+  await pool.query(`CREATE FUNCTION reject_probe() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+    IF NEW.cycle_id='rollback' THEN RAISE EXCEPTION 'test failure'; END IF; RETURN NEW; END $$;
+    CREATE TRIGGER probe BEFORE INSERT ON ledger_events FOR EACH ROW EXECUTE FUNCTION reject_probe()`);
+  try {
+    assert.equal((await post(e)).status,500);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM events WHERE idpk=$1',[e.idpk])).rows[0].n,0);
+  } finally { await pool.query('DROP TRIGGER probe ON ledger_events; DROP FUNCTION reject_probe()'); }
+  assert.equal((await post(e)).status,201);
+});
+test('payload invalido no altera tablas; otros tipos se preservan sin efecto contable', async () => {
+  const e = status('invalid'); e.data.energy.consumption=-1;
+  assert.equal((await post(e)).status,422); assert.equal(await getCycleState(pool,'invalid'),null);
+  const other = message('give','phase2',{target:randomUUID(),energy:10,pricePerEnergy:3});
+  const r = await post(other); assert.equal(r.status,201); assert.equal(r.body.ledgerApplied,false);
+  assert.equal(await getCycleState(pool,'phase2'),null);
+  assert.equal((await fetch(base + '/cycles/phase2/ledger')).status,404);
+});
+test('event log impide update/delete/truncate y reinicio reconstruye el mismo estado', async () => {
+  for (const query of ["UPDATE ledger_events SET type=type", 'DELETE FROM ledger_events', 'TRUNCATE ledger_events']) {
+    await assert.rejects(pool.query(query), /append-only/);
+  }
+  const before = await getCycleState(pool,'alpha');
+  await stopServer(); await startServer();
+  assert.deepEqual(await getCycleState(pool,'alpha'),before);
+  const newPool = new Pool({ connectionString:process.env.TEST_DATABASE_URL,options:`-c search_path=${schema}` });
+  try { assert.deepEqual(await getCycleState(newPool,'alpha'),before); } finally { await newPool.end(); }
+});
+
+
+test('demand aplica ambos signos sin transfer adicional, acepta saldo negativo e ignora duplicados', async () => {
+  await post(status('demand'));
+  const initial = await getCycleState(pool, 'demand');
+  const incoming = message('demand-statement','demand',{balance:{quantity:30,valuePerKwh:2}});
+  const results = await Promise.all([post(incoming),post({...incoming,msgId:randomUUID()})]);
+  assert.deepEqual(results.map(r=>r.status).sort(),[200,201]);
+  let state = await getCycleState(pool,'demand');
+  assert.equal(state.energyBalance,'10');
+  assert.equal(Number(state.budgetBalance),Number(initial.budgetBalance)-60);
+  await post(message('demand-statement','demand',{balance:{quantity:-5,valuePerKwh:3}}));
+  state = await getCycleState(pool,'demand');
+  assert.equal(state.energyBalance,'5');
+  assert.equal(Number(state.budgetBalance),Number(initial.budgetBalance)-45);
+  assert.ok(Number(state.budgetBalance)<0);
+  // A refreshed status does not erase previous exchanges.
+  await post(status('demand'));
+  assert.equal((await getCycleState(pool,'demand')).energyBalance,'5');
+  assert.equal((await post(message('demand-statement','demand',{balance:{quantity:5,valuePerKwh:-1}}))).status,422);
+});
+test('demanda anterior al status se aplica cuando llega el estado; decimales exactos', async () => {
+  const before = (await pool.query('SELECT budget_balance FROM cycle_state ORDER BY last_operation_seq DESC LIMIT 1')).rows[0];
+  await post(message('demand-statement','early-demand',{balance:{quantity:0.1,valuePerKwh:0.2}}));
+  assert.equal((await getCycleState(pool,'early-demand')).energyBalance,null);
+  await post(status('early-demand'));
+  const state = await getCycleState(pool,'early-demand');
+  assert.equal(state.energyBalance,'-19.9');
+  assert.equal((await pool.query('SELECT $1::numeric - $2::numeric AS delta',[before.budget_balance,state.budgetBalance])).rows[0].delta,'0.02');
+});
+
+
+test('API + worker + publisher HTTP: opensAt sobrevive al reinicio y conserva identificadores', async t => {
+  const http = require('node:http');
+  const outgoing = []; let corrected;
+  const connector = http.createServer(async (req,res) => {
+    try {
+      let raw='';for await(const chunk of req)raw+=chunk;
+      const envelope=JSON.parse(raw);outgoing.push(envelope);
+      await post(message('ack',envelope.cycleId,{target:envelope.msgId}));
+      if(outgoing.length===1){
+        corrected=new Date(Date.now()+900);
+        await post(message('error',envelope.cycleId,{target:envelope.msgId,message:'early',opensAt:corrected.toISOString()},{reason:'REPORT_TOO_EARLY',code:422}));
+      }
+      res.writeHead(201,{'Content-Type':'application/json'});res.end(JSON.stringify(envelope));
+    }catch(err){res.writeHead(500);res.end(JSON.stringify({error:err.message}));}
+  });
+  connector.listen(0,'127.0.0.1');await once(connector,'listening');
+  t.after(()=>new Promise(resolve=>connector.close(resolve)));
+  const env={REPORTS_ENABLED:'true',LEDGER_BASELINE_CONFIRMED:'true',CONNECTOR_URL:`http://127.0.0.1:${connector.address().port}`};
+  // Remove the deliberately unsupported fixture; it is not part of the ledger.
+  await pool.query("DELETE FROM events WHERE type='give'");
+  await stopServer();await startServer(env);
+  const fresh=status('http-report',{timestamp:new Date().toISOString()});
+  fresh.data.validUntil=new Date(Date.now()+5*60000+300).toISOString();
+  assert.equal((await post(fresh)).status,201);
+  async function until(condition) {
+    for(let i=0;i<100;i++){if(await condition())return;await new Promise(r=>setTimeout(r,30));}
+    assert.fail('No progreso del reporte: '+logs);
+  }
+  await until(async()=>{const r=await fetch(base+'/cycles/http-report/report');return (await r.json()).status==='pending' && outgoing.length===1;});
+  assert.equal(outgoing.length,1);
+  await stopServer();await startServer(env);
+  await until(async()=>{const r=await fetch(base+'/cycles/http-report/report');return (await r.json()).status==='acknowledged';});
+  assert.equal(outgoing.length,2);
+  assert.equal(outgoing[0].idpk,outgoing[1].idpk);assert.notEqual(outgoing[0].msgId,outgoing[1].msgId);
+  assert.ok(Date.parse(outgoing[1].timestamp)>=+corrected);
+  const report=await (await fetch(base+'/cycles/http-report/report')).json();
+  assert.equal(report.attemptCount,2);
+  assert.equal(report.attempts[1].scheduled_at,corrected.toISOString());
+  const health=await (await fetch(base+'/health')).json();assert.equal(health.reporter.enabled,true);
+  await stopServer();await startServer();
+});

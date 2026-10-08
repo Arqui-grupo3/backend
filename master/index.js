@@ -1,12 +1,95 @@
+require('newrelic');
 require('dotenv').config();
 const express = require('express');
-const { randomUUID } = require('crypto');
+const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
+const ledger = require('./ledger');
+const reports = require('./reports');
+const negotiations = require('./negotiations');
+
+const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
+if (REPORTS_ENABLED && process.env.LEDGER_BASELINE_CONFIRMED !== 'true') {
+  throw new Error('Reportes requieren LEDGER_BASELINE_CONFIRMED=true tras verificar el saldo inicial.');
+}
+
+let reportWorker;
+let negotiationWorker;
+
+const PORT = process.env.PORT || 3000;
+const AUTH_REQUIRED = process.env.AUTH_REQUIRED === 'true';
+const AUTH0_ISSUER = process.env.AUTH0_ISSUER;
+const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE;
+const AUTH0_JWKS_URL = process.env.AUTH0_JWKS_URL || (AUTH0_ISSUER ? `${AUTH0_ISSUER.replace(/\/$/, '')}/.well-known/jwks.json` : null);
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const CONNECTOR_URL = process.env.CONNECTOR_URL || 'http://connector:3001';
+const MAX_PAGE_LIMIT = 100;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-const PORT = process.env.PORT || 3000;
+let jwksCache = { expiresAt: 0, keys: new Map() };
+
+function unauthorized(res, message = 'Autenticacion requerida') {
+  return res.status(401).json({ error: message });
+}
+
+async function getSigningKey(kid) {
+  if (!AUTH0_JWKS_URL) throw new Error('Falta AUTH0_JWKS_URL');
+  if (Date.now() >= jwksCache.expiresAt) {
+    const response = await fetch(AUTH0_JWKS_URL);
+    if (!response.ok) throw new Error(`No se pudo obtener el JWKS (${response.status})`);
+    const body = await response.json();
+    jwksCache = {
+      expiresAt: Date.now() + 15 * 60 * 1000,
+      keys: new Map((body.keys || []).map((key) => [key.kid, key])),
+    };
+  }
+  const jwk = jwksCache.keys.get(kid);
+  if (!jwk) throw new Error('La llave del token no esta en el JWKS');
+  return createPublicKey({ key: jwk, format: 'jwk' });
+}
+
+async function authenticate(req, res, next) {
+  if (!AUTH_REQUIRED) return next();
+  const header = req.get('authorization') || '';
+  const match = header.match(/^Bearer\s+([^\s]+)$/i);
+  if (!match) return unauthorized(res);
+
+  try {
+    const [encodedHeader, encodedPayload, encodedSignature] = match[1].split('.');
+    if (!encodedHeader || !encodedPayload || !encodedSignature) return unauthorized(res, 'Token invalido');
+    const tokenHeader = JSON.parse(Buffer.from(encodedHeader, 'base64url').toString('utf8'));
+    const claims = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+    if (tokenHeader.alg !== 'RS256' || typeof tokenHeader.kid !== 'string') return unauthorized(res, 'Algoritmo de token no permitido');
+    const audienceValid = Array.isArray(claims.aud)
+      ? claims.aud.includes(AUTH0_AUDIENCE)
+      : claims.aud === AUTH0_AUDIENCE;
+    if (claims.iss !== AUTH0_ISSUER || !audienceValid || !Number.isFinite(claims.exp) || claims.exp <= Date.now() / 1000) {
+      return unauthorized(res, 'Claims del token invalidos');
+    }
+    const key = await getSigningKey(tokenHeader.kid);
+    const valid = verify(
+      'RSA-SHA256',
+      Buffer.from(`${encodedHeader}.${encodedPayload}`),
+      key,
+      Buffer.from(encodedSignature, 'base64url')
+    );
+    if (!valid) return unauthorized(res, 'Firma del token invalida');
+    req.auth = claims;
+    return next();
+  } catch (err) {
+    console.error('[master] Error autenticando request:', err.message);
+    return unauthorized(res, 'Token invalido');
+  }
+}
 
 const pool = new Pool({
   host: process.env.PGHOST || 'localhost',
@@ -28,13 +111,34 @@ async function initDb() {
         CREATE TABLE IF NOT EXISTS events (
           id UUID PRIMARY KEY,
           idpk TEXT UNIQUE NOT NULL,
+          msg_id UUID,
           type TEXT NOT NULL,
+          cycle_id TEXT,
           package_body JSONB,
           received_at TIMESTAMPTZ NOT NULL,
           seq BIGSERIAL
         );
       `);
       await pool.query('CREATE INDEX IF NOT EXISTS idx_events_seq ON events (seq);');
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_events_cycle_id ON events (cycle_id);');
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS api_audit (
+          id UUID PRIMARY KEY,
+          idpk TEXT,
+          msg_id UUID,
+          type TEXT NOT NULL,
+          cycle_id TEXT,
+          reason TEXT NOT NULL,
+          details JSONB NOT NULL DEFAULT '{}'::jsonb,
+          received_at TIMESTAMPTZ NOT NULL,
+          seq BIGSERIAL
+        );
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_received_at ON api_audit (received_at DESC);');
+      await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_reason ON api_audit (reason);');
+
+      // Tabla unificada de auditoría y rechazados (persistanceDev)
       await pool.query(`
         CREATE TABLE IF NOT EXISTS rejected_messages (
           id UUID PRIMARY KEY,
@@ -57,7 +161,9 @@ async function initDb() {
       await pool.query(`ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS response_status TEXT NOT NULL DEFAULT 'none'
         CHECK (response_status IN ('none', 'pending', 'published'));`);
       await pool.query('ALTER TABLE rejected_messages ADD COLUMN IF NOT EXISTS response_payload JSONB;');
-      console.log('[master] Conectado a Postgres. Tabla "events" lista.');
+
+      await ledger.migrate(pool);
+      console.log('[master] Conectado a Postgres. Tablas listas.');
       return;
     } catch (err) {
       console.error(`[master] Postgres no disponible aun (intento ${attempt}/${maxRetries}): ${err.message}`);
@@ -71,11 +177,38 @@ async function initDb() {
 app.get('/health', async (req, res) => {
   try {
     const result = await pool.query('SELECT COUNT(*)::int AS count FROM events');
-    res.status(200).json({ status: 'ok', uptime: process.uptime(), count: result.rows[0].count });
+    const reporter = reportWorker?.health || { enabled: false };
+    const negotiator = negotiationWorker?.health || { enabled: false };
+    const reporterHealthy = !reporter.enabled || (!reporter.lastError && Date.now() - Date.parse(reporter.lastTick || reporter.startedAt) < 60000);
+    const negotiatorHealthy = !negotiator.enabled || (!negotiator.lastError && Date.now() - Date.parse(negotiator.lastTick || negotiator.startedAt) < 60000);
+    const healthy = reporterHealthy && negotiatorHealthy;
+    res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'error', uptime: process.uptime(), count: result.rows[0].count, reporter, negotiator });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
   }
 });
+
+async function insertEvent(event) {
+  const result = await ledger.recordEvent(pool, event);
+  reportWorker?.wake();
+  negotiationWorker?.wake();
+  return result;
+}
+
+async function forwardToConnector(path, body) {
+  const response = await fetch(`${CONNECTOR_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(result.error || `connector respondió ${response.status}`);
+    error.statusCode = response.status;
+    throw error;
+  }
+  return result;
+}
 
 app.post('/events', async (req, res) => {
   const body = req.body;
@@ -84,25 +217,19 @@ app.post('/events', async (req, res) => {
     return res.status(400).json({ error: 'Body invalido, se esperaba JSON' });
   }
 
-  const { idpk, type, data, packageBody, receivedAt } = body;
+  const { idpk, type, receivedAt } = body;
 
   if (!idpk || !type) {
     return res.status(400).json({ error: 'Faltan campos requeridos: idpk, type' });
   }
 
-  const id = randomUUID();
   const receivedAtValue = receivedAt || new Date().toISOString();
 
   try {
-    const result = await pool.query(
-      `INSERT INTO events (id, idpk, type, package_body, received_at)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (idpk) DO NOTHING
-       RETURNING id`,
-      [id, idpk, type, data ?? packageBody ?? null, receivedAtValue]
-    );
+    const result = await insertEvent({ ...body, receivedAt: receivedAtValue });
 
-    if (result.rowCount === 0) {
+    if (!result.inserted) {
+      // Registro de duplicado en rejected_messages (flujo persistanceDev)
       await pool.query(
         `INSERT INTO rejected_messages
          (id, idpk, msg_id, type, category, reason, payload, received_at)
@@ -110,21 +237,23 @@ app.post('/events', async (req, res) => {
         [randomUUID(), idpk, typeof body.msgId === 'string' ? body.msgId : null,
           type, 'DUPLICADO', 'DUPLICATE_IDPK', JSON.stringify(body), receivedAtValue]
       );
-      return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk });
+      return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk, duplicate: true });
     }
 
-    console.log(`[master] Evento almacenado. id=${id} idpk=${idpk}`);
-    res.status(201).json({ id });
+    console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);
+    res.status(201).json({ id: result.id, ledgerApplied: result.ledgerApplied });
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
-    res.status(500).json({ error: 'Error interno al guardar el evento' });
+    res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el evento' });
   }
 });
 
+// Endpoint unificado de auditoría para recibir NACKs y descartes desde el conector
 app.post('/audit', async (req, res) => {
   const body = req.body;
   const discardReasons = new Set(['INVALID_JSON', 'INVALID_ENVELOPE', 'MISSING_MSGID', 'UNEXPECTED_ROUTING_KEY', 'INVALID_RESPONSE']);
   const nackCodes = { MALFORMED_MESSAGE: 422, UNKNOWN_TYPE: 400, IDPK_EQUALS_MSGID: 422, IDENTITY_MISMATCH: 403 };
+  
   if (!body || typeof body !== 'object' || Array.isArray(body)
       || !['DESCARTE', 'NACK'].includes(body.category) || typeof body.reason !== 'string'
       || typeof body.rawBody !== 'string' || typeof body.detail !== 'string' || !body.detail.trim()
@@ -139,10 +268,12 @@ app.post('/audit', async (req, res) => {
       || !Object.hasOwn(body.payload, 'msgId'))) {
     return res.status(400).json({ error: 'Registro NACK requiere reason/code validos y el mensaje rechazado con msgId' });
   }
+  
   const receivedAt = body.receivedAt ?? new Date().toISOString();
   if (typeof receivedAt !== 'string' || !Number.isFinite(Date.parse(receivedAt))) {
     return res.status(400).json({ error: 'receivedAt debe ser una fecha valida' });
   }
+  
   const payload = body.payload ?? null;
   const id = randomUUID();
   try {
@@ -169,6 +300,7 @@ app.patch('/audit/:id/response', async (req, res) => {
   const isUuid = value => typeof value === 'string'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
   const nackCodes = { MALFORMED_MESSAGE: 422, UNKNOWN_TYPE: 400, IDPK_EQUALS_MSGID: 422, IDENTITY_MISMATCH: 403 };
+  
   if (!isUuid(req.params.id) || !response || response.type !== 'nack' || response.cityId !== 'REE'
       || !isUuid(response.msgId) || !isUuid(response.idpk) || response.msgId.toLowerCase() === response.idpk.toLowerCase()
       || typeof response.reason !== 'string' || !Object.hasOwn(nackCodes, response.reason)
@@ -198,18 +330,16 @@ app.patch('/audit/:id/response', async (req, res) => {
   }
 });
 
-app.get('/audit', async (req, res) => {
-  const page = Number(req.query.page ?? 1);
-  const limit = Number(req.query.limit ?? 25);
+// GET Audit ahora expone el flujo enriquecido de persistanceDev
+app.get('/audit', authenticate, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
   const offset = (page - 1) * limit;
-  if (!Number.isSafeInteger(page) || page < 1 || !Number.isSafeInteger(limit)
-      || limit < 1 || limit > 100 || !Number.isSafeInteger(offset)) {
-    return res.status(400).json({ error: 'page debe ser un entero positivo y limit un entero entre 1 y 100' });
-  }
 
   const filters = { category: 'category', idpk: 'idpk', msgId: 'msg_id', type: 'type', reason: 'reason', responseStatus: 'response_status' };
   const clauses = [];
   const values = [];
+  
   for (const [key, column] of Object.entries(filters)) {
     const value = req.query[key];
     if (value === undefined) continue;
@@ -243,33 +373,103 @@ app.get('/audit', async (req, res) => {
   }
 });
 
-app.get('/distance-table', async (req, res) => {
+app.get('/cycles/:cycleId/report', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, idpk, type, package_body AS "data", received_at AS "receivedAt"
-       FROM events
-       WHERE type = 'distance-table'
-         AND jsonb_typeof(package_body->'distances') = 'object'
-       ORDER BY seq DESC
-       LIMIT 1`
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'No hay una distance-table vigente registrada' });
-    }
-
-    res.json(result.rows[0]);
+    const report = await reports.getReport(pool, req.params.cycleId);
+    if (!report) return res.status(404).json({ error: 'Ciclo sin reporte programado' });
+    res.json(report);
   } catch (err) {
-    console.error('[master] Error al consultar /distance-table:', err.message);
-    res.status(500).json({ error: 'Error interno al consultar la distance-table vigente' });
+    console.error('[master] Error al consultar reporte:', err.message);
+    res.status(500).json({ error: 'Error al consultar reporte' });
   }
 });
 
-app.get('/history', async (req, res) => {
-  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-  const limit = Math.max(parseInt(req.query.limit, 10) || 25, 1);
+app.get('/cycles/:cycleId/ledger', authenticate, async (req, res) => {
+  try {
+    const state = await ledger.getCycleState(pool, req.params.cycleId);
+    if (!state) return res.status(404).json({ error: 'Ciclo sin operaciones de ledger' });
+    res.json({ ...state, scope: 'status-transfers-and-demands', historicalBaseline: 'zero-at-ledger-installation' });
+  } catch (err) {
+    console.error('[master] Error al consultar ledger:', err.message);
+    res.status(500).json({ error: 'Error al consultar ledger' });
+  }
+});
 
-  const allowedColumns = { id: 'id', idpk: 'idpk', type: 'type', receivedAt: 'received_at' };
+app.get('/cycles', authenticate, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
+  try {
+    const result = await pool.query(
+      `SELECT cycle_id AS "cycleId",
+              COUNT(*)::int AS "operationCount",
+              MIN(received_at) AS "startedAt",
+              MAX(received_at) AS "lastOperationAt",
+              (ARRAY_AGG(type ORDER BY seq DESC))[1] AS "lastOperationType",
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'status-statement'), '[]') AS "statusStatements",
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'transfer'), '[]') AS transfers,
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'demand-statement'), '[]') AS "demandStatements",
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'negotiation-proposal'), '[]') AS negotiations,
+              COALESCE(JSONB_AGG(package_body) FILTER (WHERE type = 'negotiation-report'), '[]') AS "negotiationReports",
+              (ARRAY_AGG(package_body ORDER BY seq DESC) FILTER (WHERE type = 'negotiation-report'))[1] AS "finalBalances"
+       FROM events
+       WHERE cycle_id IS NOT NULL
+       GROUP BY cycle_id
+       ORDER BY MAX(seq) DESC
+       LIMIT $1 OFFSET $2`,
+      [limit, (page - 1) * limit]
+    );
+    return res.json({ page, limit, data: result.rows });
+  } catch (err) {
+    console.error('[master] Error al consultar /cycles:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar ciclos' });
+  }
+});
+
+app.get('/cycles/:cycleId', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT cycle_id AS "cycleId",
+              COUNT(*)::int AS "operationCount",
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'status-statement'), '[]') AS "statusStatements",
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'transfer'), '[]') AS transfers,
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'demand-statement'), '[]') AS "demandStatements",
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type IN ('negotiation-proposal', 'give', 'take', 'transfer')), '[]') AS negotiations,
+              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'negotiation-report'), '[]') AS "negotiationReports",
+              (ARRAY_AGG(package_body ORDER BY seq DESC) FILTER (WHERE type = 'negotiation-report'))[1] AS "finalBalances",
+              (ARRAY_AGG(type ORDER BY seq DESC))[1] AS "lastOperationType",
+              (ARRAY_AGG(received_at ORDER BY seq DESC))[1] AS "lastOperationAt"
+       FROM events
+       WHERE cycle_id = $1
+       GROUP BY cycle_id`,
+      [req.params.cycleId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Ciclo no encontrado' });
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[master] Error al consultar ciclo:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar ciclo' });
+  }
+});
+
+app.post('/negotiations', authenticate, async (req, res) => {
+  const { cycleId, direction, quantity, pricePerEnergy } = req.body || {};
+  try {
+    const job = await negotiations.createProposal(pool, { cycleId, direction, quantity, pricePerEnergy });
+    negotiationWorker?.wake();
+    return res.status(201).json(job);
+  } catch (err) {
+    console.error('[master] Error al crear propuesta:', err.message);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/history', authenticate, async (req, res) => {
+  const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
+
+  const allowedColumns = {
+    id: 'id', idpk: 'idpk', msgId: 'msg_id', type: 'type', cycleId: 'cycle_id', receivedAt: 'received_at',
+  };
   const reserved = new Set(['page', 'limit']);
 
   const whereClauses = [];
@@ -278,7 +478,9 @@ app.get('/history', async (req, res) => {
   for (const [key, value] of Object.entries(req.query)) {
     if (reserved.has(key)) continue;
     const column = allowedColumns[key];
-    if (!column) continue;
+    if (!column) {
+      return res.status(400).json({ error: `Parametro de filtro no soportado: ${key}` });
+    }
 
     if (column === 'received_at' && /^\d{4}-\d{2}-\d{2}$/.test(String(value))) {
       values.push(`${value}%`);
@@ -298,7 +500,10 @@ app.get('/history', async (req, res) => {
     const offset = (page - 1) * limit;
 
     const dataResult = await pool.query(
-      `SELECT id, idpk, type, package_body AS "data", received_at AS "receivedAt"
+      `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
+              package_body AS data, received_at AS "receivedAt",
+              CASE WHEN ROW_NUMBER() OVER (PARTITION BY cycle_id ORDER BY seq DESC) = 1
+                   THEN true ELSE false END AS "lastOperation"
        FROM events
        ${whereSql}
        ORDER BY seq ASC
@@ -313,10 +518,14 @@ app.get('/history', async (req, res) => {
   }
 });
 
-app.get('/history/:id', async (req, res) => {
+app.get('/history/:id', authenticate, async (req, res) => {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(req.params.id)) {
+    return res.status(400).json({ error: 'El id debe ser un UUID valido' });
+  }
   try {
     const result = await pool.query(
-      `SELECT id, idpk, type, package_body AS "data", received_at AS "receivedAt"
+      `SELECT id, idpk, msg_id AS "msgId", type, cycle_id AS "cycleId",
+              package_body AS data, received_at AS "receivedAt"
        FROM events WHERE id = $1`,
       [req.params.id]
     );
@@ -332,8 +541,85 @@ app.get('/history/:id', async (req, res) => {
   }
 });
 
+app.get('/distance-table', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, idpk, type, package_body AS "data", received_at AS "receivedAt"
+       FROM events
+       WHERE type = 'distance-table'
+         AND jsonb_typeof(package_body->'distances') = 'object'
+       ORDER BY seq DESC
+       LIMIT 1`
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'No hay una distance-table vigente registrada' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('[master] Error al consultar /distance-table:', err.message);
+    res.status(500).json({ error: 'Error interno al consultar la distance-table vigente' });
+  }
+});
+
+app.get('/connectivity', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, cycle_id AS "cycleId", package_body AS data, received_at AS "receivedAt"
+       FROM events
+       WHERE type = 'distance-table'
+       ORDER BY seq DESC
+       LIMIT 1`
+    );
+    res.json(result.rows[0] || null);
+  } catch (err) {
+    console.error('[master] Error al consultar /connectivity:', err.message);
+    res.status(500).json({ error: 'Error interno al consultar conectividad' });
+  }
+});
+
+app.get('/negotiations', authenticate, async (req, res) => {
+  try {
+    const data = await negotiations.getNegotiations(pool, {
+      cycleId: req.query.cycleId,
+      limit: req.query.limit,
+    });
+    res.json({ data });
+  } catch (err) {
+    console.error('[master] Error al consultar /negotiations:', err.message);
+    res.status(500).json({ error: 'Error interno al consultar negociaciones' });
+  }
+});
+
 initDb().then(() => {
+  reportWorker = reports.startWorker(pool, async envelope => {
+    const response = await fetch(`${CONNECTOR_URL}/publish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`Publicacion de reporte: HTTP ${response.status}`);
+    const published = await response.json();
+    if (published.msgId !== envelope.msgId || published.idpk !== envelope.idpk) throw new Error('Connector no preservo IDs del reporte');
+  }, { enabled: REPORTS_ENABLED });
+
+  negotiationWorker = negotiations.startWorker(pool, async envelope => {
+    const response = await fetch(`${CONNECTOR_URL}/publish`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) throw new Error(`Publicacion de negociacion: HTTP ${response.status}`);
+    const published = await response.json();
+    if (published.msgId !== envelope.msgId || published.idpk !== envelope.idpk) throw new Error('Connector no preservo IDs de la negociacion');
+  }, { enabled: true });
+
   app.listen(PORT, () => {
     console.log(`[master] Escuchando en http://localhost:${PORT}`);
   });
+});
+
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(422).json({ reason: 'MALFORMED_MESSAGE' });
+  }
+  console.error('[master]', err.message);
+  res.status(500).json({ error: 'Error interno' });
 });
