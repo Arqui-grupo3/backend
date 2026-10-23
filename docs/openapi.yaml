@@ -1,0 +1,386 @@
+openapi: 3.0.3
+info:
+  title: EnergyShark City Node API
+  version: 1.0.0
+  description: API JSON de consulta del nodo REE.
+servers:
+  - url: https://api.example.com
+    description: API Gateway de produccion
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Servicio disponible
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /events:
+    post:
+      security: []
+      description: Endpoint interno usado por connector; confirma despues de persistir el mensaje y su aplicacion al ledger.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Envelope'
+      responses:
+        '201':
+          description: Evento persistido
+        '200':
+          description: idpk ya persistido; no se reaplica
+        '400':
+          description: Request invalida
+        '422':
+          description: Mensaje de ledger invalido; no se persiste
+  /history:
+    get:
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: cycleId
+          schema: { type: string }
+        - in: query
+          name: type
+          schema: { type: string }
+        - in: query
+          name: receivedAt
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Historial paginado de mensajes persistidos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedEvents'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          description: Filtro o paginacion invalida
+  /history/{id}:
+    get:
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Evento encontrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Evento no encontrado
+  /cycles:
+    get:
+      description: Resumen paginado de los ciclos con sus operaciones y balances finales.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Resumen de ciclos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCycles'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /cycles/{cycleId}/report:
+    get:
+      description: >-
+        Trabajo persistido e intentos de negotiation-report. acknowledged solo
+        confirma recepcion; un error posterior de la central puede reprogramarlo.
+        Campos de fecha en UTC. Los envios estan deshabilitados por defecto.
+      parameters:
+        - in: path
+          name: cycleId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Programacion, snapshot enviado e historial de intentos
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cycle_id, idpk, status, due_at, closes_at, attemptCount, attempts]
+                properties:
+                  cycle_id: { type: string }
+                  idpk: { type: string, format: uuid }
+                  status: { type: string, enum: [pending, sending, sent, acknowledged, failed, expired, blocked] }
+                  due_at: { type: string, format: date-time }
+                  closes_at: { type: string, format: date-time }
+                  attemptCount: { type: integer }
+                  last_error: { type: string, nullable: true }
+                  payload: { type: object, nullable: true }
+                  snapshot_seq: { type: string, nullable: true }
+                  attempts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        msg_id: { type: string, format: uuid }
+                        attempt: { type: integer }
+                        envelope: { type: object }
+                        scheduled_at: { type: string, format: date-time }
+                        started_at: { type: string, format: date-time }
+                        published_at: { type: string, format: date-time, nullable: true }
+                        ack_at: { type: string, format: date-time, nullable: true }
+                        error_reason: { type: string, nullable: true }
+                        publish_error: { type: string, nullable: true }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Ciclo sin trabajo programado
+        '500':
+          description: No se pudo consultar el reporte
+  /cycles/{cycleId}/ledger:
+    get:
+      description: >-
+        Proyeccion de status-statement, transfer recibidos y demand-statement, desde la
+        instalacion del ledger con base cero. No incluye negociaciones voluntarias.
+        budgetBalance es el saldo global observado en asOfSequence, no un saldo
+        de cierre; energyBalance es propio del ciclo. Importes decimales como strings.
+      parameters:
+        - in: path
+          name: cycleId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Estado reconstruido desde operaciones inmutables
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [cycleId, initialized, budgetBalance, energyBalance, asOfSequence, scope, historicalBaseline]
+                properties:
+                  cycleId: { type: string }
+                  initialized: { type: boolean }
+                  budgetBalance: { type: string, example: '500.3' }
+                  energyBalance: { type: string, nullable: true, example: '-20' }
+                  generationCapacity: { type: string, nullable: true }
+                  consumption: { type: string, nullable: true }
+                  generationCost: { type: string, nullable: true }
+                  validUntil: { type: string, format: date-time, nullable: true }
+                  asOfSequence: { type: string }
+                  lastOperationId: { type: string, format: uuid }
+                  lastOperationType: { type: string }
+                  lastOperationAt: { type: string, format: date-time }
+                  scope: { type: string, enum: [status-transfers-and-demands] }
+                  historicalBaseline: { type: string, enum: [zero-at-ledger-installation] }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No existen operaciones aplicadas para ese ciclo
+        '500':
+          description: No se pudo consultar el ledger
+  /cycles/{cycleId}:
+    get:
+      parameters:
+        - in: path
+          name: cycleId
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Detalle consolidado del ciclo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CycleSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Ciclo no encontrado
+  /connectivity:
+    get:
+      responses:
+        '200':
+          description: Ultima distance-table recibida
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Event'
+                  - type: object
+                    nullable: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /negotiations:
+    get:
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Propuestas, confirmaciones, pagos y errores
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedEvents'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      description: Crea y publica una propuesta voluntaria hacia la central.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NegotiationProposalRequest'
+      responses:
+        '201':
+          description: Propuesta publicada y registrada como pendiente
+        '400':
+          description: Datos invalidos
+        '502':
+          description: Connector o broker no disponible
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /audit:
+    get:
+      description: Registro consultable de duplicados y otros mensajes rechazados o descartados.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: reason
+          schema:
+            type: string
+            enum: [DUPLICATE_IDPK, DISCARDED, NACK]
+      responses:
+        '200':
+          description: Auditoria paginada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedAudit'
+        '400':
+          description: Razon invalida
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Page:
+      in: query
+      name: page
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+    Id:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Unauthorized:
+      description: Token Auth0 ausente o invalido
+  schemas:
+    Health:
+      type: object
+      required: [status, uptime, count]
+      properties:
+        status: { type: string, example: ok }
+        uptime: { type: number }
+        count: { type: integer }
+    Envelope:
+      type: object
+      required: [idpk, msgId, type, timestamp, data]
+      properties:
+        idpk: { type: string, format: uuid }
+        msgId: { type: string, format: uuid }
+        type: { type: string }
+        timestamp: { type: string, format: date-time }
+        cycleId: { type: string }
+        cityId: { type: string, example: REE }
+        data: { type: object, additionalProperties: true }
+    Event:
+      type: object
+      required: [id, idpk, type, receivedAt]
+      properties:
+        id: { type: string, format: uuid }
+        idpk: { type: string }
+        msgId: { type: string, format: uuid, nullable: true }
+        type: { type: string }
+        cycleId: { type: string, nullable: true }
+        data: { type: object, additionalProperties: true }
+        receivedAt: { type: string, format: date-time }
+        lastOperation: { type: boolean }
+        status: { type: string, enum: [pending, confirmed, paid, expired, failed, unknown] }
+    AuditEntry:
+      type: object
+      required: [id, type, reason, receivedAt]
+      properties:
+        id: { type: string, format: uuid }
+        idpk: { type: string, nullable: true }
+        msgId: { type: string, format: uuid, nullable: true }
+        type: { type: string }
+        cycleId: { type: string, nullable: true }
+        reason: { type: string, enum: [DUPLICATE_IDPK, DISCARDED, NACK] }
+        details: { type: object, additionalProperties: true }
+        receivedAt: { type: string, format: date-time }
+    PaginatedEvents:
+      type: object
+      required: [data]
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Event' }
+    PaginatedAudit:
+      type: object
+      required: [page, limit, total, totalPages, data]
+      properties:
+        page: { type: integer }
+        limit: { type: integer, maximum: 100 }
+        total: { type: integer }
+        totalPages: { type: integer }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/AuditEntry' }
+    NegotiationProposalRequest:
+      type: object
+      required: [cycleId, direction, quantity, pricePerEnergy]
+      properties:
+        cycleId: { type: string }
+        direction: { type: string, enum: [give, take] }
+        quantity: { type: number, exclusiveMinimum: 0 }
+        pricePerEnergy: { type: number, minimum: 0 }
+    CycleSummary:
+      type: object
+      required: [cycleId, operationCount, lastOperationType]
+      properties:
+        cycleId: { type: string }
+        operationCount: { type: integer }
+        statusStatements: { type: array, items: { type: object } }
+        transfers: { type: array, items: { type: object } }
+        demandStatements: { type: array, items: { type: object } }
+        negotiations: { type: array, items: { type: object } }
+        negotiationReports: { type: array, items: { type: object } }
+        finalBalances: { type: object, nullable: true }
+        lastOperationType: { type: string }
+        lastOperationAt: { type: string, format: date-time }
+    PaginatedCycles:
+      type: object
+      required: [page, limit, data]
+      properties:
+        page: { type: integer }
+        limit: { type: integer, maximum: 100 }
+        data: { type: array, items: { $ref: '#/components/schemas/CycleSummary' } }

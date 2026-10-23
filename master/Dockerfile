@@ -1,4 +1,4 @@
-FROM node:20-alpine
+FROM node:22-alpine
 
 RUN apk add --no-cache curl
 
@@ -8,6 +8,10 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY index.js ./
+COPY ledger/ ./ledger/
+COPY reports/ ./reports/
+COPY negotiations/ ./negotiations/
+COPY migrations/ ./migrations/
 
 ENV PORT=3000
 EXPOSE 3000
