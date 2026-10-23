@@ -6,12 +6,16 @@ const { Pool } = require('pg');
 const ledger = require('./ledger');
 const reports = require('./reports');
 const negotiations = require('./negotiations');
+const market = require('./market');
+const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
 if (REPORTS_ENABLED && process.env.LEDGER_BASELINE_CONFIRMED !== 'true') {
   throw new Error('Reportes requieren LEDGER_BASELINE_CONFIRMED=true tras verificar el saldo inicial.');
 }
 
+let wallet = null;
+let walletWorker;
 let reportWorker;
 let negotiationWorker;
 
@@ -211,7 +215,15 @@ async function forwardToConnector(path, body) {
   }
   return result;
 }
-
+app.post('/market', async (req, res) => {
+     try {
+       const result = await market.recordMarketMessage(pool, req.body);
+       res.status(result.duplicate ? 200 : 201).json(result);
+     } catch (err) {
+       if (err.statusCode !== 422) console.error('[master] Error al guardar mensaje de mercado:', err.message);
+       res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el mensaje de mercado' });
+     }
+   });
 app.post('/events', async (req, res) => {
   const body = req.body;
 
@@ -231,7 +243,6 @@ app.post('/events', async (req, res) => {
     const result = await insertEvent({ ...body, receivedAt: receivedAtValue });
 
     if (!result.inserted) {
-      // Registro de duplicado en rejected_messages (flujo persistanceDev)
       await pool.query(
         `INSERT INTO rejected_messages
          (id, idpk, msg_id, type, category, reason, payload, received_at)
@@ -250,7 +261,6 @@ app.post('/events', async (req, res) => {
   }
 });
 
-// Endpoint unificado de auditoría para recibir NACKs y descartes desde el conector
 app.post('/audit', async (req, res) => {
   const body = req.body;
   const discardReasons = new Set(['INVALID_JSON', 'INVALID_ENVELOPE', 'MISSING_MSGID', 'UNEXPECTED_ROUTING_KEY', 'INVALID_RESPONSE']);
@@ -612,6 +622,12 @@ initDb().then(() => {
     const published = await response.json();
     if (published.msgId !== envelope.msgId || published.idpk !== envelope.idpk) throw new Error('Connector no preservo IDs de la negociacion');
   }, { enabled: true });
+     if (process.env.WALLET_BASE_URL && process.env.WALLET_API_KEY) {
+     wallet = createWalletClient({ pool, baseUrl: process.env.WALLET_BASE_URL, apiKey: process.env.WALLET_API_KEY });
+     walletWorker = wallet.startRetryWorker();
+   } else {
+     console.warn('[master] Falta WALLET_BASE_URL o WALLET_API_KEY: cliente de la wallet deshabilitado');
+   }
 
   app.listen(PORT, () => {
     console.log(`[master] Escuchando en http://localhost:${PORT}`);
