@@ -3,8 +3,8 @@ const fs = require('node:fs');
 const amqp = require('amqplib');
 const http = require('node:http');
 const { createPublisher } = require('./publisher');
-const { validateEnvelope } = require('./validation');
-const RESPONSE_TYPES = new Set(['ack', 'nack', 'error']);
+const { validateEnvelope, validateMarketMessage, cityFromUserId } = require('./validation');
+const RESPONSE_TYPES = new Set(['ack', 'nack', 'error', 'bid-rejected']);
 
 const {
   RABBIT_URL,
@@ -14,8 +14,11 @@ const {
   RABBIT_PASS,
   RABBIT_VHOST = '',
   RABBIT_QUEUE,
+  RABBIT_MARKET_QUEUE,
+  MARKET_PREFETCH = '20',
   MASTER_URL = 'http://localhost:3000/events',
   AUDIT_URL = new URL('audit', MASTER_URL).toString(),
+  MARKET_URL = new URL('market', MASTER_URL).toString(),
   CONNECTOR_CONTROL_PORT = '3001',
 } = process.env;
 
@@ -32,8 +35,19 @@ if (!RABBIT_QUEUE) {
   process.exit(1);
 }
 
+if (!RABBIT_MARKET_QUEUE) {
+  console.warn('[connector] Falta RABBIT_MARKET_QUEUE (ej: market.REE): no se consumirá el feed de mercado.');
+}
+
+function replyRoutingKey(event, userId) {
+  if (event && event.sender === 'central') return 'central';
+  const city = cityFromUserId(userId);
+  return city ? `city.${city}` : null;
+}
+
 const RECONNECT_DELAY_MS = 5000;
 const MASTER_RETRY_DELAY_MS = 3000;
+
 const HEALTH_FILE = process.env.HEALTH_FILE || '/tmp/connector-healthy';
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const MAX_NOT_CONSUMING_MS = Number(process.env.MAX_NOT_CONSUMING_MS || 120_000);
@@ -150,7 +164,7 @@ async function main() {
       let raw = '';
       for await (const chunk of req) raw += chunk;
       const body = JSON.parse(raw);
-      const message = await publishMessage(body);
+      const message = await publishMessage(body, body.routingKey);
       res.writeHead(201, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(message));
     } catch (err) {
@@ -179,7 +193,9 @@ async function main() {
       const receivedAt = new Date().toISOString();
       const raw = msg.content.toString('utf8');
       const routingKey = msg.fields?.routingKey;
-      
+      const userId = msg.properties?.userId;
+      const replyTo = replyRoutingKey(null, userId);
+
       if (!['city.REE', 'city.broadcast'].includes(routingKey)) {
         const detail = `Routing key inesperada: ${JSON.stringify(routingKey)}`;
         console.error(`[connector] ${detail}`);
@@ -220,7 +236,8 @@ async function main() {
       }
 
       try {
-        const invalid = validateEnvelope(event);
+        const invalid = validateEnvelope(event, { userId });
+        const respondTo = replyRoutingKey(event, userId) ?? replyTo;
         if (invalid) {
           console.error(`[connector] Mensaje rechazado: ${invalid.reason} msgId=${JSON.stringify(event.msgId)}: ${invalid.message}`);
           if (RESPONSE_TYPES.has(event.type)) {
@@ -234,11 +251,16 @@ async function main() {
             category: 'NACK', reason: invalid.reason, code: invalid.code,
             detail: invalid.message, payload: event, rawBody: raw, routingKey, receivedAt,
           });
+          if (!respondTo) {
+            console.warn(`[connector] NACK sin destinatario (user_id ${JSON.stringify(userId)}); solo se registra.`);
+            channel.ack(msg);
+            return;
+          }
           const data = { target: event.msgId, message: invalid.message };
-          if (Object.hasOwn(event, 'cycleId')) data.cycleId = event.cycleId;
+          if (typeof event.cycleId === 'string' && event.cycleId.length <= 64) data.cycleId = event.cycleId;
           const nack = await publishMessage({
             type: 'nack', reason: invalid.reason, code: invalid.code, data,
-          });
+          }, respondTo);
           const response = await fetch(`${AUDIT_URL}/${audit.id}/response`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
@@ -264,7 +286,7 @@ async function main() {
 
         console.log(`[connector] Enviado a master OK (idpk=${event.idpk})`);
         if (!RESPONSE_TYPES.has(event.type)) {
-          await publishMessage({ type: "ack", data: { target: event.msgId } });
+          await publishMessage({ type: 'ack', data: { target: event.msgId } }, respondTo);
         }
 
         channel.ack(msg);
@@ -277,8 +299,76 @@ async function main() {
     },
     { noAck: false }
   );
+
+  if (RABBIT_MARKET_QUEUE) await consumeMarket(connection);
+
   setConsuming(true);
   writeHeartbeat();
+}
+
+async function consumeMarket(connection) {
+  const marketChannel = await connection.createChannel();
+  marketChannel.on('error', (err) => {
+    setConsuming(false);
+    console.error('[connector] Error del canal de mercado:', err.message);
+  });
+  marketChannel.on('close', () => {
+    setConsuming(false);
+    console.warn('[connector] Canal de mercado cerrado.');
+  });
+  await marketChannel.prefetch(Number(MARKET_PREFETCH) || 20);
+  console.log(`[connector] Escuchando la cola de mercado "${RABBIT_MARKET_QUEUE}"...`);
+
+  await marketChannel.consume(
+    RABBIT_MARKET_QUEUE,
+    async (msg) => {
+      if (msg === null) return;
+      const receivedAt = new Date().toISOString();
+      const raw = msg.content.toString('utf8');
+      const routingKey = msg.fields?.routingKey;
+
+      let event;
+      try {
+        event = JSON.parse(raw);
+      } catch (err) {
+        await discardMessage(marketChannel, msg, {
+          reason: 'INVALID_JSON', detail: `Feed de mercado: ${err.message}`, rawBody: raw, routingKey, receivedAt,
+        });
+        return;
+      }
+
+      const invalid = validateMarketMessage(event, { routingKey });
+      if (invalid) {
+        console.error(`[connector] Mensaje de mercado descartado: ${invalid.reason}: ${invalid.message}`);
+        await discardMessage(marketChannel, msg, {
+          reason: 'INVALID_ENVELOPE', detail: `Feed de mercado (${invalid.reason}): ${invalid.message}`,
+          payload: event, rawBody: raw, routingKey, receivedAt,
+        });
+        return;
+      }
+
+      try {
+        const response = await fetch(MARKET_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...event, receivedAt, routingKey }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (response.status >= 400 && response.status < 500) {
+          console.error(`[connector] master rechazó el mensaje de mercado (${response.status}); se descarta.`);
+          marketChannel.ack(msg);
+          return;
+        }
+        if (!response.ok) throw new Error(`master respondió ${response.status}`);
+        marketChannel.ack(msg);
+      } catch (err) {
+        console.error('[connector] No se pudo entregar el mensaje de mercado, se reencola:', err.message);
+        await sleep(MASTER_RETRY_DELAY_MS);
+        marketChannel.nack(msg, false, true);
+      }
+    },
+    { noAck: false }
+  );
 }
 
 main().catch((err) => {

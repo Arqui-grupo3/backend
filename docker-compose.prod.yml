@@ -50,6 +50,8 @@ services:
       AUTH0_ISSUER: ${AUTH0_ISSUER}
       AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
       AUTH0_JWKS_URL: ${AUTH0_JWKS_URL}
+      WALLET_BASE_URL: ${WALLET_BASE_URL:-}
+      WALLET_API_KEY: ${WALLET_API_KEY:-}
     depends_on:
       db:
         condition: service_healthy

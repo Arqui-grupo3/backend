@@ -12,6 +12,8 @@ COPY ledger/ ./ledger/
 COPY reports/ ./reports/
 COPY negotiations/ ./negotiations/
 COPY migrations/ ./migrations/
+COPY market/ ./market/
+COPY effects/ ./effects/
 
 ENV PORT=3000
 EXPOSE 3000
