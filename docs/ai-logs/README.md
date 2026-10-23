@@ -9,7 +9,7 @@ La documentación sigue un esquema modular por integrante y responsabilidad téc
 ## Índice por Integrante y Rol
 
 | Módulo | Responsable | Rol / Alcance Principal | Herramientas | Enlace |
-| :--- | :--- | :--- | :--- | :--- |
+| **P1** | Francisco |  | Claude | [Ver logs P1](P1/README.md) |
 | **P2** | Juan Garrido | Protocolo AMQP v2, contratos JSON Schema, broker RabbitMQ, despliegue base y persistencia PostgreSQL. | Codex | [Ver logs P2](P2/README.md) |
 | **P3** | Pedro | Ledger inmutable append-only, demandas de central, negociaciones voluntarias (take/give ≤30s), liquidación contable y scheduler durable de reportes. | Codex / Antigravity | [Ver logs P3](P3/README.md) |
 | **P4** | Matías Santos | Endpoints de consulta API REST (RF01, RF02, RF04, RF05), auditoría y filtros de historial. | Cursor / ChatGPT | [Ver logs P4](log-conversacion-P4.md) |
@@ -19,7 +19,7 @@ La documentación sigue un esquema modular por integrante y responsabilidad téc
 
 ## Estructura Estándar de los Registros
 
-Cada subcarpeta (`P2/`, `P3/`, `P5/`) dispone de:
+Cada subcarpeta (`P1/`, `P2/`, `P3/`, `P5/`) dispone de:
 1. Un archivo `README.md` que detalla el alcance del rol, la tabla de sesiones cronológicas y el estado que respaldan los registros.
 2. Archivos cronológicos individuales nombrados bajo la convención:
    ```text
