@@ -2,7 +2,7 @@ services:
   db:
     image: postgres:16-alpine
     container_name: db
-    restart: unless-stopped
+    restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-energyshark}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-energyshark}
@@ -20,7 +20,7 @@ services:
   master:
     build: ./master
     container_name: master
-    restart: unless-stopped
+    restart: always
     ports:
       - "3000:3000"
     environment:
@@ -38,6 +38,8 @@ services:
       AUTH0_ISSUER: ${AUTH0_ISSUER:-}
       AUTH0_AUDIENCE: ${AUTH0_AUDIENCE:-}
       AUTH0_JWKS_URL: ${AUTH0_JWKS_URL:-}
+      WALLET_BASE_URL: ${WALLET_BASE_URL:-}
+      WALLET_API_KEY: ${WALLET_API_KEY:-}
     depends_on:
       db:
         condition: service_healthy
@@ -47,7 +49,7 @@ services:
   connector:
     build: ./connector
     container_name: connector
-    restart: unless-stopped
+    restart: always
     env_file:
       - ./connector/.env
     environment:
