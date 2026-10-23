@@ -1,4 +1,5 @@
 require('dotenv').config();
+const fs = require('node:fs');
 const amqp = require('amqplib');
 const http = require('node:http');
 const { createPublisher } = require('./publisher');
@@ -33,6 +34,38 @@ if (!RABBIT_QUEUE) {
 
 const RECONNECT_DELAY_MS = 5000;
 const MASTER_RETRY_DELAY_MS = 3000;
+const HEALTH_FILE = process.env.HEALTH_FILE || '/tmp/connector-healthy';
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const MAX_NOT_CONSUMING_MS = Number(process.env.MAX_NOT_CONSUMING_MS || 120_000);
+
+let consuming = false;
+let lastConsumingAt = Date.now();
+
+function setConsuming(value) {
+  consuming = value;
+  if (value) lastConsumingAt = Date.now();
+}
+
+function writeHeartbeat() {
+  if (consuming) {
+    lastConsumingAt = Date.now();
+    try {
+      fs.writeFileSync(HEALTH_FILE, new Date(lastConsumingAt).toISOString());
+    } catch (err) {
+      console.error('[connector] No se pudo escribir el heartbeat:', err.message);
+    }
+    return;
+  }
+  const idleMs = Date.now() - lastConsumingAt;
+  if (idleMs > MAX_NOT_CONSUMING_MS) {
+    console.error(
+      `[connector] ${Math.round(idleMs / 1000)}s sin consumir la cola; se termina el proceso para que Docker lo reinicie.`
+    );
+    process.exit(1);
+  }
+}
+
+setInterval(writeHeartbeat, HEARTBEAT_INTERVAL_MS).unref();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -85,19 +118,28 @@ async function main() {
   }
 
   connection.on('error', (err) => {
+    setConsuming(false);
     console.error('[connector] Error de conexión:', err.message);
   });
 
   connection.on('close', () => {
+    setConsuming(false);
     console.warn('[connector] Conexión cerrada. Reintentando en ' + RECONNECT_DELAY_MS / 1000 + 's...');
     setTimeout(main, RECONNECT_DELAY_MS);
   });
 
   const channel = await connection.createChannel();
+  channel.on('error', (err) => {
+    setConsuming(false);
+    console.error('[connector] Error del canal:', err.message);
+  });
+  channel.on('close', () => {
+    setConsuming(false);
+    console.warn('[connector] Canal cerrado.');
+  });
   await channel.prefetch(1);
   const publishMessage = await createPublisher(connection);
 
-  // Servidor de control para publicar desde la API (introducido en rama main)
   const controlServer = http.createServer(async (req, res) => {
     if (req.method !== 'POST' || req.url !== '/publish') {
       res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -129,7 +171,7 @@ async function main() {
 
   console.log(`[connector] Escuchando la cola "${RABBIT_QUEUE}"...`);
 
-  channel.consume(
+  await channel.consume(
     RABBIT_QUEUE,
     async (msg) => {
       if (msg === null) return;
@@ -235,6 +277,8 @@ async function main() {
     },
     { noAck: false }
   );
+  setConsuming(true);
+  writeHeartbeat();
 }
 
 main().catch((err) => {
