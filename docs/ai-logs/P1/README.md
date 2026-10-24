@@ -13,6 +13,7 @@
 | [02 · Heartbeat del connector](2026-10-22-23-p1-02-heartbeat-connector.md) | Corrección del heartbeat, watchdog, `restart: always` y prueba local. |
 | [03 · Estado de la oferta y lock por offerId](2026-10-24-p1-03-estado-oferta-y-lock-bids.md) | Máquina de estados de venta, tablas `seller_offers` y `seller_bids`, serialización transaccional con `pg_advisory_xact_lock`, deduplicación RF05 y suite de 5 pruebas unitarias/integración. |
 | [04 · Vendedor simple y publicador de mercado](2026-10-24-p1-04-vendedor-simple-publicador-mercado.md) | Publicación de ofertas competitivas frente a MET, emisión de `offer-updated`/`offer-withdrawn`, respuestas `bid-rejected` con `available` y suite de 8 pruebas integradas. |
+| [05 · Registro de duplicados y NACK por IDENTITY_MISMATCH](2026-10-24-p1-05-registro-duplicados-y-nack-rf05.md) | Auditoría en `rejected_messages` de bids duplicados (`DUPLICATE_IDPK`), rechazo y sobre NACK 403 por `IDENTITY_MISMATCH`, e invarianza matemática del ledger (RF05). |
 
 ## Criterios de edición
 
@@ -22,10 +23,11 @@ No se compartieron credenciales con el asistente. Las pruebas se ejecutaron cont
 
 ## Estado que respaldan estos registros
 
-Los documentos y código respaldan la Fase 0 y Fase 1 completas del Roadmap para P1:
+Los documentos y código respaldan la Fase 0, Fase 1 y requerimiento RF05 completos del Roadmap para P1:
 - El estado de la oferta y el bloqueo consultivo transaccional por `offerId` garantizan matemáticamente cero sobreventas y cero `INSUFFICIENT_ASSET`.
-- Idempotencia nativa ante reintentos de bids (RF05).
+- Idempotencia nativa ante reintentos de bids (RF05) con registro formal en auditoría (`rejected_messages` con `DUPLICATE_IDPK`).
+- Validación estricta de identidad contra suplantación (`IDENTITY_MISMATCH`), despacho de sobre NACK 403 y registro en auditoría.
 - Restitución automática de saldo vendible ante expiración de swaps (Anomalía 3).
 - Publicación de ofertas competitivas frente a MET con cota inferior de no pérdida.
 - Notificación formal de rechazos (`bid-rejected`) con `available` y actualización reactiva de la pizarra (`offer-updated` / `offer-withdrawn`).
-- 8 de 8 pruebas automatizadas aprobadas.
+- 11 de 11 pruebas automatizadas aprobadas en seller (19 pruebas en conjunto con ledger/effects).

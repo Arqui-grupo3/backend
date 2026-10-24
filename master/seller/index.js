@@ -134,6 +134,46 @@ async function sendBidRejected({
 }
 
 /**
+ * Extrae el código de ciudad de un userId con formato city.<CITY>.
+ */
+function cityFromUserId(userId) {
+  const match = typeof userId === 'string' ? userId.match(/^city\.([A-Z]{3})$/) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * Despacha un sobre nack hacia la ciudad compradora reportando el rechazo de protocolo.
+ */
+async function sendBidNack({
+  bidEvent,
+  reason = 'IDENTITY_MISMATCH',
+  code = 403,
+  message = 'user_id no corresponde al cityId indicado',
+  connectorUrl = CONNECTOR_URL,
+  fetchFn = globalThis.fetch
+} = {}) {
+  if (!bidEvent || !bidEvent.cityId || !bidEvent.msgId || !connectorUrl) return null;
+  const envelope = {
+    type: 'nack',
+    cycleId: bidEvent.cycleId,
+    reason,
+    code,
+    routingKey: `city.${bidEvent.cityId}`,
+    data: {
+      target: bidEvent.msgId,
+      message
+    }
+  };
+
+  try {
+    return await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+  } catch (err) {
+    console.error(`[seller] Error enviando nack a ${bidEvent.cityId}:`, err.message);
+    return null;
+  }
+}
+
+/**
  * Emite offer-updated al feed de mercado para actualizar el remaining público.
  */
 async function publishOfferUpdated({
@@ -250,11 +290,54 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
   const pricePerEnergy = data.pricePerEnergy;
   const buyerCityId = bidEvent.cityId;
   const cycleId = bidEvent.cycleId;
+  const userId = bidEvent.userId;
 
   if (!offerId || typeof offerId !== 'string') fail('bid requiere data.offerId');
   if (!Number.isInteger(quantity) || quantity <= 0) fail('bid requiere data.quantity entero positivo');
   if (typeof pricePerEnergy !== 'number' || !Number.isFinite(pricePerEnergy) || pricePerEnergy <= 0) {
     fail('bid requiere data.pricePerEnergy numérico positivo');
+  }
+
+  // Validación defensiva de identidad (RF05 / AGENTS.md):
+  // Si viene provisto userId, debe coincidir estrictamente con city.<cityId>
+  if (userId) {
+    const senderCity = cityFromUserId(userId);
+    if (!senderCity || senderCity !== buyerCityId) {
+      const detail = `user_id ${userId} no corresponde al cityId ${buyerCityId || '(ausente)'}.`;
+      await pool.query(
+        `INSERT INTO rejected_messages
+         (id, idpk, msg_id, type, category, reason, code, payload, received_at, routing_key, detail, response_status)
+         VALUES ($1, $2, $3, $4, 'NACK', 'IDENTITY_MISMATCH', 403, $5, $6, $7, $8, 'sent')`,
+        [
+          randomUUID(),
+          idpk,
+          bidEvent.msgId || null,
+          'bid',
+          JSON.stringify(bidEvent),
+          bidEvent.receivedAt || new Date().toISOString(),
+          `city.${buyerCityId}`,
+          detail
+        ]
+      );
+
+      await sendBidNack({
+        bidEvent,
+        reason: 'IDENTITY_MISMATCH',
+        code: 403,
+        message: detail,
+        connectorUrl,
+        fetchFn
+      }).catch(() => null);
+
+      return {
+        accepted: false,
+        duplicate: false,
+        nack: true,
+        reason: 'IDENTITY_MISMATCH',
+        code: 403,
+        detail
+      };
+    }
   }
 
   const client = await pool.connect();
@@ -278,6 +361,23 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
     if (existing.rowCount > 0) {
       const prev = existing.rows[0];
       const isAccepted = prev.status !== 'rejected';
+
+      // RF05: Registrar intento duplicado en la tabla de auditoría rejected_messages
+      await client.query(
+        `INSERT INTO rejected_messages
+         (id, idpk, msg_id, type, category, reason, payload, received_at, detail)
+         VALUES ($1, $2, $3, $4, 'DUPLICADO', 'DUPLICATE_IDPK', $5, $6, $7)`,
+        [
+          randomUUID(),
+          idpk,
+          bidEvent.msgId || null,
+          'bid',
+          JSON.stringify(bidEvent),
+          bidEvent.receivedAt || new Date().toISOString(),
+          `Bid duplicado recibido (idpk=${idpk}). Estado previo: ${prev.status}`
+        ]
+      );
+
       await client.query('COMMIT');
       return {
         duplicate: true,
@@ -460,6 +560,8 @@ module.exports = {
   calculateSellerPrice,
   publishSellerOffer,
   sendBidRejected,
+  sendBidNack,
+  cityFromUserId,
   publishOfferUpdated,
   publishOfferWithdrawn,
   dispatchToConnector

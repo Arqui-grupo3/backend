@@ -13,11 +13,34 @@ const {
   calculateSellerPrice,
   publishSellerOffer,
   sendBidRejected,
+  sendBidNack,
+  cityFromUserId,
   publishOfferUpdated,
   publishOfferWithdrawn
 } = require('../seller');
 
 const hasDb = Boolean(process.env.TEST_DATABASE_URL);
+
+const REJECTED_MESSAGES_DDL = `
+  CREATE TABLE IF NOT EXISTS rejected_messages (
+    id UUID PRIMARY KEY,
+    idpk TEXT,
+    msg_id TEXT,
+    type TEXT,
+    category TEXT NOT NULL CHECK (category IN ('DUPLICADO', 'DESCARTE', 'NACK')),
+    reason TEXT NOT NULL,
+    payload JSONB,
+    received_at TIMESTAMPTZ NOT NULL,
+    seq BIGSERIAL,
+    raw_body TEXT,
+    routing_key TEXT,
+    detail TEXT,
+    code INTEGER,
+    response_status TEXT NOT NULL DEFAULT 'none',
+    response_payload JSONB
+  );
+  CREATE INDEX IF NOT EXISTS idx_rejected_messages_idpk ON rejected_messages (idpk);
+`;
 
 async function fixture(t) {
   const schema = 'seller_test_' + randomUUID().replaceAll('-', '');
@@ -30,6 +53,7 @@ async function fixture(t) {
     await admin.end();
   });
   await pool.query(readFileSync(join(__dirname, '../migrations/008-seller.sql'), 'utf8'));
+  await pool.query(REJECTED_MESSAGES_DDL);
   return pool;
 }
 
@@ -125,6 +149,13 @@ test('seller: idempotencia de bids duplicados (RF05)', { skip: !hasDb }, async (
 
   const state = await getSellerOffer(pool, offerId);
   assert.equal(state.available, 40, 'No debe descontar stock dos veces por un bid duplicado');
+
+  // RF05: Verificar que el reintento duplicado quedó registrado en rejected_messages
+  const auditRes = await pool.query('SELECT * FROM rejected_messages WHERE idpk = $1', [bid.idpk]);
+  assert.equal(auditRes.rowCount, 1, 'El bid duplicado debe registrarse en rejected_messages');
+  assert.equal(auditRes.rows[0].category, 'DUPLICADO');
+  assert.equal(auditRes.rows[0].reason, 'DUPLICATE_IDPK');
+  assert.equal(auditRes.rows[0].type, 'bid');
 });
 
 test('seller: liberación de inventario tras expiración de swap (Anomalía 3)', { skip: !hasDb }, async (t) => {
@@ -330,6 +361,157 @@ test('seller: flujo integrado de oferta, rechazo y actualización de remanente',
   assert.equal(accResult.available, 20);
   assert.equal(published[2].type, 'offer-updated');
   assert.equal(published[2].data.remaining, 20);
+});
+
+test('seller: detección de IDENTITY_MISMATCH, emisión de NACK 403 y registro en rejected_messages', { skip: !hasDb }, async (t) => {
+  const pool = await fixture(t);
+  const published = [];
+  const mockFetch = async (url, opts) => {
+    published.push(JSON.parse(opts.body));
+    return { ok: true, json: async () => ({ status: 'ok' }) };
+  };
+
+  const offerId = 'REE-oferta-identity-mismatch';
+  await createSellerOffer(pool, {
+    offerId,
+    cycleId: 'cycle-id-mismatch',
+    totalQuantity: 100,
+    pricePerEnergy: 300
+  });
+
+  // Bid que declara cityId: 'COR' pero viene autenticado con userId: 'city.VAL' (suplantación)
+  const fakeBid = {
+    msgId: randomUUID(),
+    idpk: randomUUID(),
+    cycleId: 'cycle-id-mismatch',
+    cityId: 'COR',
+    userId: 'city.VAL',
+    data: { offerId, quantity: 20, pricePerEnergy: 300 }
+  };
+
+  const decision = await processIncomingBid(pool, fakeBid, {
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  // 1. Decisión de rechazo estricta por identidad
+  assert.equal(decision.accepted, false);
+  assert.equal(decision.nack, true);
+  assert.equal(decision.reason, 'IDENTITY_MISMATCH');
+  assert.equal(decision.code, 403);
+
+  // 2. Sobre NACK despachado al conector hacia la cola city.COR
+  assert.equal(published.length, 1);
+  assert.equal(published[0].type, 'nack');
+  assert.equal(published[0].reason, 'IDENTITY_MISMATCH');
+  assert.equal(published[0].code, 403);
+  assert.equal(published[0].routingKey, 'city.COR');
+  assert.equal(published[0].data.target, fakeBid.msgId);
+
+  // 3. Registro persistido en la tabla de auditoría rejected_messages
+  const auditRes = await pool.query('SELECT * FROM rejected_messages WHERE idpk = $1', [fakeBid.idpk]);
+  assert.equal(auditRes.rowCount, 1);
+  assert.equal(auditRes.rows[0].category, 'NACK');
+  assert.equal(auditRes.rows[0].reason, 'IDENTITY_MISMATCH');
+  assert.equal(auditRes.rows[0].code, 403);
+
+  // 4. Inventario de la oferta permanece 100% intacto
+  const offerState = await getSellerOffer(pool, offerId);
+  assert.equal(offerState.available, 100, 'El inventario disponible no debe alterarse por un bid con IDENTITY_MISMATCH');
+});
+
+test('seller: invarianza de inventario ante ráfagas de duplicados y NACKs (RF05)', { skip: !hasDb }, async (t) => {
+  const pool = await fixture(t);
+  const offerId = 'REE-oferta-invarianza';
+  await createSellerOffer(pool, {
+    offerId,
+    cycleId: 'cycle-inv',
+    totalQuantity: 80,
+    pricePerEnergy: 250
+  });
+
+  // 1. Bid legítimo inicial de 30 kWh
+  const validBid = {
+    msgId: randomUUID(),
+    idpk: randomUUID(),
+    cycleId: 'cycle-inv',
+    cityId: 'HGW',
+    userId: 'city.HGW',
+    data: { offerId, quantity: 30, pricePerEnergy: 250 }
+  };
+  const firstRes = await processIncomingBid(pool, validBid, { connectorUrl: null });
+  assert.equal(firstRes.accepted, true);
+  assert.equal(firstRes.available, 50);
+
+  // 2. Ráfaga de 4 reintentos duplicados con el mismo idpk
+  for (let i = 0; i < 4; i++) {
+    const dupRes = await processIncomingBid(pool, validBid, { connectorUrl: null });
+    assert.equal(dupRes.duplicate, true);
+    assert.equal(dupRes.accepted, true);
+  }
+
+  // 3. Ráfaga de 3 bids inválidos con IDENTITY_MISMATCH
+  for (let i = 0; i < 3; i++) {
+    const fake = {
+      msgId: randomUUID(),
+      idpk: randomUUID(),
+      cycleId: 'cycle-inv',
+      cityId: 'VAL',
+      userId: 'city.COR', // No coincide
+      data: { offerId, quantity: 15, pricePerEnergy: 250 }
+    };
+    const nackRes = await processIncomingBid(pool, fake, { connectorUrl: null });
+    assert.equal(nackRes.nack, true);
+    assert.equal(nackRes.reason, 'IDENTITY_MISMATCH');
+  }
+
+  // 4. Verificación de auditoría: 4 filas de duplicados y 3 filas de NACK
+  const dupAudit = await pool.query("SELECT COUNT(*)::int AS total FROM rejected_messages WHERE category = 'DUPLICADO' AND reason = 'DUPLICATE_IDPK'");
+  const nackAudit = await pool.query("SELECT COUNT(*)::int AS total FROM rejected_messages WHERE category = 'NACK' AND reason = 'IDENTITY_MISMATCH'");
+  assert.equal(dupAudit.rows[0].total, 4, 'Deben registrarse exactamente 4 intentos duplicados');
+  assert.equal(nackAudit.rows[0].total, 3, 'Deben registrarse exactamente 3 intentos con IDENTITY_MISMATCH');
+
+  // 5. El inventario disponible permanece exactamente en 50 kWh (invarianza)
+  const finalState = await getSellerOffer(pool, offerId);
+  assert.equal(finalState.available, 50, 'El stock remanente debe mantenerse estrictamente en 50 kWh');
+});
+
+test('seller: sobres NACK y helper cityFromUserId', async () => {
+  assert.equal(cityFromUserId('city.REE'), 'REE');
+  assert.equal(cityFromUserId('city.VAL'), 'VAL');
+  assert.equal(cityFromUserId('central'), null);
+  assert.equal(cityFromUserId(''), null);
+  assert.equal(cityFromUserId(null), null);
+  assert.equal(cityFromUserId(undefined), null);
+
+  const sent = [];
+  const mockFetch = async (url, opts) => {
+    sent.push(JSON.parse(opts.body));
+    return { ok: true, json: async () => ({ status: 'ok' }) };
+  };
+
+  const bidEvent = {
+    msgId: 'msg-test-123',
+    cityId: 'VAL',
+    cycleId: 'cycle-test'
+  };
+
+  await sendBidNack({
+    bidEvent,
+    reason: 'IDENTITY_MISMATCH',
+    code: 403,
+    message: 'user_id no corresponde',
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].type, 'nack');
+  assert.equal(sent[0].routingKey, 'city.VAL');
+  assert.equal(sent[0].reason, 'IDENTITY_MISMATCH');
+  assert.equal(sent[0].code, 403);
+  assert.equal(sent[0].data.target, 'msg-test-123');
+  assert.equal(sent[0].data.message, 'user_id no corresponde');
 });
 
 
