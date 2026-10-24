@@ -12,6 +12,7 @@ COPY ledger/ ./ledger/
 COPY reports/ ./reports/
 COPY negotiations/ ./negotiations/
 COPY migrations/ ./migrations/
+COPY wallet/ ./wallet/
 COPY market/ ./market/
 COPY effects/ ./effects/
 

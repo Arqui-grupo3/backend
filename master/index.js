@@ -7,6 +7,7 @@ const ledger = require('./ledger');
 const reports = require('./reports');
 const negotiations = require('./negotiations');
 const market = require('./market');
+const seller = require('./seller');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
@@ -224,6 +225,25 @@ app.post('/market', async (req, res) => {
        res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el mensaje de mercado' });
      }
    });
+
+app.post('/seller/offer', async (req, res) => {
+  try {
+    const offer = await seller.createSellerOffer(pool, req.body);
+    res.status(201).json(offer);
+  } catch (err) {
+    res.status(err.statusCode || 400).json({ error: err.message });
+  }
+});
+
+app.get('/seller/offer/:offerId', async (req, res) => {
+  try {
+    const offer = await seller.getSellerOffer(pool, req.params.offerId);
+    if (!offer) return res.status(404).json({ error: 'Oferta no encontrada' });
+    res.json(offer);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.post('/events', async (req, res) => {
   const body = req.body;
 
@@ -239,6 +259,16 @@ app.post('/events', async (req, res) => {
 
   const receivedAtValue = receivedAt || new Date().toISOString();
 
+  if (type === 'bid') {
+    try {
+      const decision = await seller.processIncomingBid(pool, { ...body, receivedAt: receivedAtValue }, { walletClient: wallet });
+      return res.status(200).json({ idpk, type: 'bid', decision });
+    } catch (err) {
+      console.error('[master] Error al procesar bid:', err.message);
+      return res.status(err.statusCode || 500).json({ error: err.message });
+    }
+  }
+
   try {
     const result = await insertEvent({ ...body, receivedAt: receivedAtValue });
 
@@ -251,6 +281,14 @@ app.post('/events', async (req, res) => {
           type, 'DUPLICADO', 'DUPLICATE_IDPK', JSON.stringify(body), receivedAtValue]
       );
       return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk, duplicate: true });
+    }
+
+    if (type === 'swap-settled') {
+      const swapId = body.data?.swapId;
+      await seller.handleSwapSettled(pool, { swapId, swapIdpk: idpk }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
+    } else if (type === 'swap-expired' || type === 'swap-rejected' || type === 'swap-cancelled') {
+      const swapId = body.data?.swapId;
+      await seller.handleSwapReleased(pool, { swapId, swapIdpk: idpk, reason: type }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
     }
 
     console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);
