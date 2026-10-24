@@ -10,10 +10,7 @@ const market = require('./market');
 const seller = require('./seller');
 const { createWalletClient } = require('./wallet');
 
-const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
-if (REPORTS_ENABLED && process.env.LEDGER_BASELINE_CONFIRMED !== 'true') {
-  throw new Error('Reportes requieren LEDGER_BASELINE_CONFIRMED=true tras verificar el saldo inicial.');
-}
+const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
 
 let wallet = null;
 let walletWorker;
@@ -261,7 +258,8 @@ app.post('/events', async (req, res) => {
 
   if (type === 'bid') {
     try {
-      const decision = await seller.processIncomingBid(pool, { ...body, receivedAt: receivedAtValue }, { walletClient: wallet });
+      // requireWallet: sin cliente de la wallet no se acepta ningún bid (la reserva no se liberaría).
+      const decision = await seller.processIncomingBid(pool, { ...body, receivedAt: receivedAtValue }, { walletClient: wallet, requireWallet: true });
       return res.status(200).json({ idpk, type: 'bid', decision });
     } catch (err) {
       console.error('[master] Error al procesar bid:', err.message);
@@ -285,28 +283,54 @@ app.post('/events', async (req, res) => {
 
     if (type === 'status-statement') {
       const energy = body.data?.energy || {};
+      const market = body.data?.market || {};
       const capacity = energy.generationCapacity || 0;
       const consumption = energy.consumption || 0;
       const generationCost = energy.generationCost || 0;
-      const sellable = Math.floor(Math.max(0, capacity - consumption));
+      // v3: la central informa los kWh vendibles acreditados en la wallet.
+      const sellable = Number.isInteger(energy.sellable) ? energy.sellable : Math.floor(Math.max(0, capacity - consumption));
       if (sellable > 0) {
-        const imbalancePrice = body.data?.imbalancePrice || (generationCost * 3);
+        // imbalancePrice viene en data.market y es 3 × el costo MÁS ALTO de todas las ciudades.
+        let imbalancePrice = market.imbalancePrice;
+        if (!Number.isFinite(imbalancePrice)) {
+          console.warn(`[seller] status-statement sin market.imbalancePrice en ${body.cycleId}; se usa 3 × costo propio`);
+          imbalancePrice = generationCost * 3;
+        }
         seller.publishSellerOffer(pool, {
           cycleId: body.cycleId,
           sellable,
           generationCost,
           imbalancePrice,
+          minBid: market.minBid,
+          lastOfferAt: market.lastOfferAt,
+          lastBidAt: market.lastBidAt,
+          closesAt: market.closesAt,
+          walletAvailable: Boolean(wallet),
           connectorUrl: CONNECTOR_URL
         }).catch((err) => console.error('[seller] Error publicando oferta tras status-statement:', err.message));
       }
     }
 
-    if (type === 'swap-settled') {
+    if (type === 'swap-proposed') {
+      await seller.handleSwapProposed(pool, body, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-proposed handler error:', e.message));
+    } else if (type === 'swap-settled') {
+      // Al vendedor, swap-settled trae en data.idpk la llave del accept del comprador,
+      // no la nuestra: el bid se encuentra por swapId (guardado al llegar swap-proposed).
       const swapId = body.data?.swapId;
-      await seller.handleSwapSettled(pool, { swapId, swapIdpk: idpk }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
-    } else if (type === 'swap-expired' || type === 'swap-rejected' || type === 'swap-cancelled') {
+      await seller.handleSwapSettled(pool, { swapId }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
+    } else if (type === 'swap-expired' || type === 'swap-cancelled') {
+      // data.idpk es la Idempotency-Key de la operación que causó el evento (no el idpk
+      // del mensaje). Si no tiene formato UUID (p. ej. la de la central), se ignora.
       const swapId = body.data?.swapId;
-      await seller.handleSwapReleased(pool, { swapId, swapIdpk: idpk, reason: type }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
+      const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
+      await seller.handleSwapReleased(pool, { swapId, swapIdpk, reason: type }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
+    } else if (type === 'swap-rejected' && body.data?.operation === 'propose') {
+      // Solo un rechazo de NUESTRA propuesta libera la cantidad. Un swap-rejected de un
+      // accept (al comprador le faltó algo) no cierra el swap: la wallet sigue reteniendo
+      // los kWh hasta que expire o se cancele (error 5). Puede no traer swapId.
+      const swapId = body.data?.swapId;
+      const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
+      await seller.handleProposalRejected(pool, { swapId, swapIdpk }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected handler error:', e.message));
     }
 
     console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);

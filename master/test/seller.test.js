@@ -30,6 +30,7 @@ async function fixture(t) {
     await admin.end();
   });
   await pool.query(readFileSync(join(__dirname, '../migrations/008-seller.sql'), 'utf8'));
+  await pool.query(readFileSync(join(__dirname, '../migrations/009-seller-market-rules.sql'), 'utf8'));
   return pool;
 }
 
