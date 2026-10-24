@@ -15,6 +15,7 @@ COPY migrations/ ./migrations/
 COPY wallet/ ./wallet/
 COPY market/ ./market/
 COPY effects/ ./effects/
+COPY seller/ ./seller/
 
 ENV PORT=3000
 EXPOSE 3000
