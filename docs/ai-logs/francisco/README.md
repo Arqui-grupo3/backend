@@ -11,8 +11,7 @@
 | --- | --- |
 | [01 · Planificación y decisiones](2026-10-21-23-p1-01-planificacion-y-decisiones.md) | Roadmap y priorización, spec, milestones, AGENTS.md, ADR 0004–0006, post-mortems de AD1–AD3 y su revisión cruzada. |
 | [02 · Heartbeat del connector](2026-10-22-23-p1-02-heartbeat-connector.md) | Corrección del heartbeat, watchdog, `restart: always` y prueba local. |
-| [03 · Estado de la oferta y lock por offerId](2026-10-24-p1-03-estado-oferta-y-lock-bids.md) | Máquina de estados de venta, tablas `seller_offers` y `seller_bids`, serialización transaccional con `pg_advisory_xact_lock`, deduplicación RF05 y suite de 5 pruebas unitarias/integración. |
-| [04 · Vendedor simple y publicador de mercado](2026-10-24-p1-04-vendedor-simple-publicador-mercado.md) | Publicación de ofertas competitivas frente a MET, emisión de `offer-updated`/`offer-withdrawn`, respuestas `bid-rejected` con `available` y suite de 8 pruebas integradas. |
+| [03 · nuevas funcionalidades](2026-10-22-23-p1-e2.md) | Cliente de wallet, cola market.REE y activacion del scheduler |
 
 ## Criterios de edición
 

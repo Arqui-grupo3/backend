@@ -12,6 +12,8 @@
 | --- | --- |
 | [01 · Ledger, persistencia y demandas](2026-10-07-p3-01-ledger-persistencia-y-demandas.md) | ADR AD2, migraciones 001 y 002, status-statement, transfer, demand-statement y contabilidad inmutable en PostgreSQL. |
 | [02 · Negociaciones voluntarias y reportes durables](2026-10-07-p3-02-negociaciones-voluntarias-y-reportes.md) | ADR AD3, migraciones 003 y 004, flujo completo proposal -> confirmación -> pago en <=30s, reintento por idpk, errores PRICE_ABOVE_CAP / OVER_CAPACITY y suite de 28 tests. |
+| [03 · Estado de la oferta y lock por offerId](2026-10-24-p1-03-estado-oferta-y-lock-bids.md) | Máquina de estados de venta, tablas `seller_offers` y `seller_bids`, serialización transaccional con `pg_advisory_xact_lock`, deduplicación RF05 y suite de 5 pruebas unitarias/integración. |
+| [04 · Vendedor simple y publicador de mercado](2026-10-24-p1-04-vendedor-simple-publicador-mercado.md) | Publicación de ofertas competitivas frente a MET, emisión de `offer-updated`/`offer-withdrawn`, respuestas `bid-rejected` con `available` y suite de 8 pruebas integradas. |
 
 ## Criterios de edición
 
