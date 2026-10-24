@@ -12,6 +12,7 @@
 | [01 · Planificación y decisiones](2026-10-21-23-p1-01-planificacion-y-decisiones.md) | Roadmap y priorización, spec, milestones, AGENTS.md, ADR 0004–0006, post-mortems de AD1–AD3 y su revisión cruzada. |
 | [02 · Heartbeat del connector](2026-10-22-23-p1-02-heartbeat-connector.md) | Corrección del heartbeat, watchdog, `restart: always` y prueba local. |
 | [03 · Estado de la oferta y lock por offerId](2026-10-24-p1-03-estado-oferta-y-lock-bids.md) | Máquina de estados de venta, tablas `seller_offers` y `seller_bids`, serialización transaccional con `pg_advisory_xact_lock`, deduplicación RF05 y suite de 5 pruebas unitarias/integración. |
+| [04 · Vendedor simple y publicador de mercado](2026-10-24-p1-04-vendedor-simple-publicador-mercado.md) | Publicación de ofertas competitivas frente a MET, emisión de `offer-updated`/`offer-withdrawn`, respuestas `bid-rejected` con `available` y suite de 8 pruebas integradas. |
 
 ## Criterios de edición
 
@@ -21,8 +22,10 @@ No se compartieron credenciales con el asistente. Las pruebas se ejecutaron cont
 
 ## Estado que respaldan estos registros
 
-Los documentos y código respaldan la Fase 0 completa del Roadmap para P1:
+Los documentos y código respaldan la Fase 0 y Fase 1 completas del Roadmap para P1:
 - El estado de la oferta y el bloqueo consultivo transaccional por `offerId` garantizan matemáticamente cero sobreventas y cero `INSUFFICIENT_ASSET`.
 - Idempotencia nativa ante reintentos de bids (RF05).
 - Restitución automática de saldo vendible ante expiración de swaps (Anomalía 3).
-- 5 de 5 pruebas automatizadas aprobadas.
+- Publicación de ofertas competitivas frente a MET con cota inferior de no pérdida.
+- Notificación formal de rechazos (`bid-rejected`) con `available` y actualización reactiva de la pizarra (`offer-updated` / `offer-withdrawn`).
+- 8 de 8 pruebas automatizadas aprobadas.
