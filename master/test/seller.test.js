@@ -9,7 +9,12 @@ const {
   getSellerOffer,
   processIncomingBid,
   handleSwapSettled,
-  handleSwapReleased
+  handleSwapReleased,
+  calculateSellerPrice,
+  publishSellerOffer,
+  sendBidRejected,
+  publishOfferUpdated,
+  publishOfferWithdrawn
 } = require('../seller');
 
 const hasDb = Boolean(process.env.TEST_DATABASE_URL);
@@ -72,8 +77,8 @@ test('seller: atención serializada de dos bids concurrentes compitiendo por sto
 
   // Simular dos peticiones casi simultáneas compitiendo por el stock de 50
   const [res1, res2] = await Promise.all([
-    processIncomingBid(pool, bid1),
-    processIncomingBid(pool, bid2)
+    processIncomingBid(pool, bid1, { connectorUrl: null }),
+    processIncomingBid(pool, bid2, { connectorUrl: null })
   ]);
 
   const accepted = [res1, res2].filter((r) => r.accepted);
@@ -109,12 +114,12 @@ test('seller: idempotencia de bids duplicados (RF05)', { skip: !hasDb }, async (
     data: { offerId, quantity: 20, pricePerEnergy: 280 }
   };
 
-  const firstCall = await processIncomingBid(pool, bid);
+  const firstCall = await processIncomingBid(pool, bid, { connectorUrl: null });
   assert.equal(firstCall.accepted, true);
   assert.equal(firstCall.duplicate, false);
 
   // Reintento idéntico con el mismo idpk
-  const secondCall = await processIncomingBid(pool, bid);
+  const secondCall = await processIncomingBid(pool, bid, { connectorUrl: null });
   assert.equal(secondCall.duplicate, true);
   assert.equal(secondCall.accepted, true);
 
@@ -140,7 +145,7 @@ test('seller: liberación de inventario tras expiración de swap (Anomalía 3)',
     data: { offerId, quantity: 40, pricePerEnergy: 200 }
   };
 
-  const result = await processIncomingBid(pool, bid);
+  const result = await processIncomingBid(pool, bid, { connectorUrl: null });
   assert.equal(result.accepted, true);
 
   let state = await getSellerOffer(pool, offerId);
@@ -165,7 +170,7 @@ test('seller: liberación de inventario tras expiración de swap (Anomalía 3)',
     data: { offerId, quantity: 30, pricePerEnergy: 200 }
   };
 
-  const newResult = await processIncomingBid(pool, newBid);
+  const newResult = await processIncomingBid(pool, newBid, { connectorUrl: null });
   assert.equal(newResult.accepted, true);
   assert.equal(newResult.available, 10);
 });
@@ -196,4 +201,135 @@ test('seller: validaciones de entrada sin base de datos', async () => {
     /bid requiere data.quantity entero positivo/
   );
 });
+
+test('seller: cálculo de precio competitivo frente a MET con cota inferior', () => {
+  // Caso 1: imbalancePrice alto, precio se ubica en 0.85 * imbalance (más barato que MET que parte en 0.9)
+  const price1 = calculateSellerPrice({ generationCost: 100, imbalancePrice: 400 });
+  assert.equal(price1, 340, 'Debe fijarse en 0.85 * 400 = 340');
+
+  // Caso 2: imbalancePrice bajo o nulo, aplica piso duro de no pérdida 1.05 * generationCost
+  const price2 = calculateSellerPrice({ generationCost: 100, imbalancePrice: 100 });
+  assert.equal(price2, 105, 'Debe aplicar piso de 1.05 * 100 = 105 para no vender a pérdida');
+
+  const price3 = calculateSellerPrice({ generationCost: 200, imbalancePrice: null });
+  assert.equal(price3, 210, 'Sin imbalancePrice, debe aplicar 1.05 * 200 = 210');
+
+  assert.throws(() => calculateSellerPrice({ generationCost: -5 }), /generationCost debe ser número positivo/);
+});
+
+test('seller: sobres de publicación y rechazo para conector AMQP', async () => {
+  const published = [];
+  const mockFetch = async (url, opts) => {
+    published.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, json: async () => ({ status: 'ok' }) };
+  };
+
+  // 1. sendBidRejected
+  await sendBidRejected({
+    bidEvent: { msgId: 'msg-bid-1', cityId: 'HGW', cycleId: 'cycle-10' },
+    available: 14,
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  assert.equal(published.length, 1);
+  assert.equal(published[0].url, 'http://mock-connector:3001/publish');
+  assert.equal(published[0].body.type, 'bid-rejected');
+  assert.equal(published[0].body.code, 409);
+  assert.equal(published[0].body.reason, 'QUANTITY_UNAVAILABLE');
+  assert.equal(published[0].body.routingKey, 'city.HGW');
+  assert.equal(published[0].body.data.target, 'msg-bid-1');
+  assert.equal(published[0].body.data.available, 14);
+
+  // 2. publishOfferUpdated
+  await publishOfferUpdated({
+    offerId: 'REE-offer-1',
+    cycleId: 'cycle-10',
+    remaining: 22,
+    pricePerEnergy: 320,
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  assert.equal(published.length, 2);
+  assert.equal(published[1].body.type, 'offer-updated');
+  assert.equal(published[1].body.data.offerId, 'REE-offer-1');
+  assert.equal(published[1].body.data.remaining, 22);
+
+  // 3. publishOfferWithdrawn
+  await publishOfferWithdrawn({
+    offerId: 'REE-offer-1',
+    cycleId: 'cycle-10',
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  assert.equal(published.length, 3);
+  assert.equal(published[2].body.type, 'offer-withdrawn');
+  assert.equal(published[2].body.data.offerId, 'REE-offer-1');
+});
+
+test('seller: flujo integrado de oferta, rechazo y actualización de remanente', { skip: !hasDb }, async (t) => {
+  const pool = await fixture(t);
+  const published = [];
+  const mockFetch = async (url, opts) => {
+    published.push(JSON.parse(opts.body));
+    return { ok: true, json: async () => ({ status: 'ok' }) };
+  };
+
+  // 1. Publicar oferta inicial de ciclo (50 kWh)
+  const offer = await publishSellerOffer(pool, {
+    cycleId: 'cycle-integrated',
+    sellable: 50,
+    generationCost: 100,
+    imbalancePrice: 400,
+    offerId: 'REE-oferta-integ',
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  assert.equal(offer.quantity, 50);
+  assert.equal(offer.pricePerEnergy, 340);
+  assert.equal(published[0].type, 'offer');
+  assert.equal(published[0].data.quantity, 50);
+
+  // 2. Bid que excede la cantidad disponible (pide 60 kWh)
+  const excessBid = {
+    msgId: randomUUID(),
+    idpk: randomUUID(),
+    cycleId: 'cycle-integrated',
+    cityId: 'WIN',
+    data: { offerId: 'REE-oferta-integ', quantity: 60, pricePerEnergy: 340 }
+  };
+
+  const rejResult = await processIncomingBid(pool, excessBid, {
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  assert.equal(rejResult.accepted, false);
+  assert.equal(rejResult.reason, 'QUANTITY_UNAVAILABLE');
+  assert.equal(published[1].type, 'bid-rejected');
+  assert.equal(published[1].data.available, 50);
+
+  // 3. Bid que cabe (pide 30 kWh)
+  const validBid = {
+    msgId: randomUUID(),
+    idpk: randomUUID(),
+    cycleId: 'cycle-integrated',
+    cityId: 'HGW',
+    data: { offerId: 'REE-oferta-integ', quantity: 30, pricePerEnergy: 340 }
+  };
+
+  const accResult = await processIncomingBid(pool, validBid, {
+    connectorUrl: 'http://mock-connector:3001',
+    fetchFn: mockFetch
+  });
+
+  assert.equal(accResult.accepted, true);
+  assert.equal(accResult.available, 20);
+  assert.equal(published[2].type, 'offer-updated');
+  assert.equal(published[2].data.remaining, 20);
+});
+
 

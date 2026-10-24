@@ -1,5 +1,8 @@
 const { randomUUID } = require('node:crypto');
 
+const CONNECTOR_URL = process.env.CONNECTOR_URL || 'http://connector:3001';
+const OWN_CITY = process.env.CITY_ID || 'REE';
+
 function fail(message, statusCode = 422) {
   const error = new Error(message);
   error.statusCode = statusCode;
@@ -8,6 +11,182 @@ function fail(message, statusCode = 422) {
 
 function round2(val) {
   return Math.round(val * 100) / 100;
+}
+
+/**
+ * Calcula un precio fijo competitivo frente al bot MET con cota inferior de no pérdida.
+ * - MET parte vendiendo a 0.9 * imbalancePrice.
+ * - Fijamos 0.85 * imbalancePrice para ser más baratos que MET.
+ * - Cota inferior de seguridad: jamás menor a 1.05 * generationCost.
+ */
+function calculateSellerPrice({ generationCost, imbalancePrice, metDiscountFactor = 0.85, profitMargin = 1.05 }) {
+  if (typeof generationCost !== 'number' || !Number.isFinite(generationCost) || generationCost <= 0) {
+    fail('generationCost debe ser número positivo');
+  }
+  const floorPrice = round2(generationCost * profitMargin);
+  let price = floorPrice;
+
+  if (typeof imbalancePrice === 'number' && Number.isFinite(imbalancePrice) && imbalancePrice > 0) {
+    const competitivePrice = round2(imbalancePrice * metDiscountFactor);
+    price = Math.max(competitivePrice, floorPrice);
+  }
+
+  return round2(price);
+}
+
+/**
+ * Helper para despachar mensajes formales AMQP vía HTTP POST hacia connector.
+ */
+async function dispatchToConnector(connectorUrl, payload, { fetchFn = globalThis.fetch, timeoutMs = 8000 } = {}) {
+  if (!connectorUrl || typeof fetchFn !== 'function') return null;
+  const res = await fetchFn(`${connectorUrl.replace(/\/$/, '')}/publish`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Connector respondió ${res.status}: ${text}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
+/**
+ * Publica la oferta del vendedor hacia el feed de mercado AMQP (market.offer.REE).
+ */
+async function publishSellerOffer(pool, {
+  cycleId,
+  sellable,
+  generationCost,
+  imbalancePrice,
+  offerId,
+  cityId = OWN_CITY,
+  connectorUrl = CONNECTOR_URL,
+  fetchFn = globalThis.fetch
+} = {}) {
+  if (!Number.isInteger(sellable) || sellable <= 0) return null;
+  if (!cycleId || typeof cycleId !== 'string') fail('cycleId requerido');
+
+  const pricePerEnergy = calculateSellerPrice({ generationCost, imbalancePrice });
+  const finalOfferId = offerId || `${cityId}-${cycleId}-offer`;
+
+  await createSellerOffer(pool, {
+    offerId: finalOfferId,
+    cycleId,
+    totalQuantity: sellable,
+    pricePerEnergy,
+    cityId
+  });
+
+  const envelope = {
+    type: 'offer',
+    cycleId,
+    data: {
+      offerId: finalOfferId,
+      quantity: sellable,
+      pricePerEnergy
+    }
+  };
+
+  try {
+    await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+  } catch (err) {
+    console.error('[seller] Error publicando oferta en mercado:', err.message);
+  }
+
+  return {
+    offerId: finalOfferId,
+    cycleId,
+    quantity: sellable,
+    pricePerEnergy
+  };
+}
+
+/**
+ * Despacha un mensaje bid-rejected hacia la ciudad compradora reportando available.
+ */
+async function sendBidRejected({
+  bidEvent,
+  available,
+  connectorUrl = CONNECTOR_URL,
+  fetchFn = globalThis.fetch
+} = {}) {
+  if (!bidEvent || !bidEvent.cityId || !bidEvent.msgId || !connectorUrl) return null;
+  const envelope = {
+    type: 'bid-rejected',
+    cycleId: bidEvent.cycleId,
+    reason: 'QUANTITY_UNAVAILABLE',
+    code: 409,
+    routingKey: `city.${bidEvent.cityId}`,
+    data: {
+      target: bidEvent.msgId,
+      available: Math.max(0, available)
+    }
+  };
+
+  try {
+    return await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+  } catch (err) {
+    console.error(`[seller] Error enviando bid-rejected a ${bidEvent.cityId}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Emite offer-updated al feed de mercado para actualizar el remaining público.
+ */
+async function publishOfferUpdated({
+  offerId,
+  cycleId,
+  remaining,
+  pricePerEnergy,
+  connectorUrl = CONNECTOR_URL,
+  fetchFn = globalThis.fetch
+} = {}) {
+  if (!offerId || !cycleId || !connectorUrl) return null;
+  const envelope = {
+    type: 'offer-updated',
+    cycleId,
+    data: {
+      offerId,
+      remaining: Math.max(0, remaining),
+      pricePerEnergy
+    }
+  };
+
+  try {
+    return await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+  } catch (err) {
+    console.error(`[seller] Error enviando offer-updated para ${offerId}:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Emite offer-withdrawn al feed de mercado cuando el inventario se agota.
+ */
+async function publishOfferWithdrawn({
+  offerId,
+  cycleId,
+  connectorUrl = CONNECTOR_URL,
+  fetchFn = globalThis.fetch
+} = {}) {
+  if (!offerId || !cycleId || !connectorUrl) return null;
+  const envelope = {
+    type: 'offer-withdrawn',
+    cycleId,
+    data: {
+      offerId
+    }
+  };
+
+  try {
+    return await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+  } catch (err) {
+    console.error(`[seller] Error enviando offer-withdrawn para ${offerId}:`, err.message);
+    return null;
+  }
 }
 
 /**
@@ -60,7 +239,7 @@ async function getSellerOffer(pool, offerId) {
  * Procesa un bid entrante de manera estrictamente serializada por oferta usando advisory lock.
  * Gestiona idempotencia por idpk (RF05) y reserva inventario antes de llamar a la wallet.
  */
-async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffsetMs = 45_000 } = {}) {
+async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffsetMs = 45_000, connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
   if (!bidEvent || typeof bidEvent !== 'object') fail('Evento bid inválido');
   const idpk = bidEvent.idpk;
   if (!idpk || typeof idpk !== 'string') fail('bid requiere idpk');
@@ -173,6 +352,9 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
       );
       await client.query('COMMIT');
 
+      // Notificar al comprador con bid-rejected informando available
+      await sendBidRejected({ bidEvent, available, connectorUrl, fetchFn }).catch(() => null);
+
       return {
         accepted: false,
         duplicate: false,
@@ -210,6 +392,27 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
     } catch (walletErr) {
       console.error(`[seller] Error al proponer swap a wallet para bid ${idpk}:`, walletErr.message);
       // Queda en 'reserved' para reintento
+    }
+  }
+
+  // 6. Notificar al feed de mercado la actualización de stock remanente
+  if (decision && decision.accepted) {
+    await publishOfferUpdated({
+      offerId,
+      cycleId,
+      remaining: decision.available,
+      pricePerEnergy: decision.pricePerEnergy,
+      connectorUrl,
+      fetchFn
+    }).catch(() => null);
+
+    if (decision.available === 0) {
+      await publishOfferWithdrawn({
+        offerId,
+        cycleId,
+        connectorUrl,
+        fetchFn
+      }).catch(() => null);
     }
   }
 
@@ -253,5 +456,11 @@ module.exports = {
   getSellerOffer,
   processIncomingBid,
   handleSwapSettled,
-  handleSwapReleased
+  handleSwapReleased,
+  calculateSellerPrice,
+  publishSellerOffer,
+  sendBidRejected,
+  publishOfferUpdated,
+  publishOfferWithdrawn,
+  dispatchToConnector
 };

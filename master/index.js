@@ -283,6 +283,24 @@ app.post('/events', async (req, res) => {
       return res.status(200).json({ message: 'Evento ya registrado (idpk duplicado)', idpk, duplicate: true });
     }
 
+    if (type === 'status-statement') {
+      const energy = body.data?.energy || {};
+      const capacity = energy.generationCapacity || 0;
+      const consumption = energy.consumption || 0;
+      const generationCost = energy.generationCost || 0;
+      const sellable = Math.floor(Math.max(0, capacity - consumption));
+      if (sellable > 0) {
+        const imbalancePrice = body.data?.imbalancePrice || (generationCost * 3);
+        seller.publishSellerOffer(pool, {
+          cycleId: body.cycleId,
+          sellable,
+          generationCost,
+          imbalancePrice,
+          connectorUrl: CONNECTOR_URL
+        }).catch((err) => console.error('[seller] Error publicando oferta tras status-statement:', err.message));
+      }
+    }
+
     if (type === 'swap-settled') {
       const swapId = body.data?.swapId;
       await seller.handleSwapSettled(pool, { swapId, swapIdpk: idpk }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
