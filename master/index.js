@@ -8,6 +8,8 @@ const reports = require('./reports');
 const negotiations = require('./negotiations');
 const market = require('./market');
 const seller = require('./seller');
+const buyer = require('./buyer/worker');
+const buyerConfig = require('./buyer/config');
 const strategyConfig = require('./config');
 const { createWalletClient } = require('./wallet');
 
@@ -15,6 +17,7 @@ const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
 
 let wallet = null;
 let walletWorker;
+let buyerWorker;
 let reportWorker;
 let negotiationWorker;
 
@@ -186,8 +189,10 @@ app.get('/health', async (req, res) => {
     const negotiator = negotiationWorker?.health || { enabled: false };
     const reporterHealthy = !reporter.enabled || (!reporter.lastError && Date.now() - Date.parse(reporter.lastTick || reporter.startedAt) < 60000);
     const negotiatorHealthy = !negotiator.enabled || (!negotiator.lastError && Date.now() - Date.parse(negotiator.lastTick || negotiator.startedAt) < 60000);
-    const healthy = reporterHealthy && negotiatorHealthy;
-    res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'error', uptime: process.uptime(), count: result.rows[0].count, reporter, negotiator });
+    const buyerHealth = buyerWorker?.health || { enabled: false };
+    const buyerHealthy = !buyerHealth.enabled || (!buyerHealth.lastError && Date.now() - Date.parse(buyerHealth.lastTick || buyerHealth.startedAt) < 60000);
+    const healthy = reporterHealthy && negotiatorHealthy && buyerHealthy;
+    res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'error', uptime: process.uptime(), count: result.rows[0].count, reporter, negotiator, buyer: buyerHealth });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
   }
@@ -197,6 +202,7 @@ async function insertEvent(event) {
   const result = await ledger.recordEvent(pool, event);
   reportWorker?.wake();
   negotiationWorker?.wake();
+  buyerWorker?.wake();
   return result;
 }
 
@@ -217,12 +223,25 @@ async function forwardToConnector(path, body) {
 app.post('/market', async (req, res) => {
      try {
        const result = await market.recordMarketMessage(pool, req.body);
+       buyerWorker?.wake();
        res.status(result.duplicate ? 200 : 201).json(result);
      } catch (err) {
        if (err.statusCode !== 422) console.error('[master] Error al guardar mensaje de mercado:', err.message);
        res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el mensaje de mercado' });
      }
    });
+
+app.get('/buyer/config', authenticate, async (req, res) => {
+  try { res.json(await buyerConfig.getConfig(pool)); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+app.put('/buyer/config', authenticate, async (req, res) => {
+  try {
+    const config = await buyerConfig.setConfig(pool, req.body);
+    buyerWorker?.wake();
+    res.json(config);
+  } catch (error) { res.status(error.statusCode || 500).json({ error: error.message }); }
+});
 
 app.post('/seller/offer', async (req, res) => {
   try {
@@ -609,6 +628,7 @@ app.post('/negotiations', authenticate, async (req, res) => {
   try {
     const job = await negotiations.createProposal(pool, { cycleId, direction, quantity, pricePerEnergy });
     negotiationWorker?.wake();
+  buyerWorker?.wake();
     return res.status(201).json(job);
   } catch (err) {
     console.error('[master] Error al crear propuesta:', err.message);
@@ -766,6 +786,8 @@ initDb().then(() => {
      if (process.env.WALLET_BASE_URL && process.env.WALLET_API_KEY) {
      wallet = createWalletClient({ pool, baseUrl: process.env.WALLET_BASE_URL, apiKey: process.env.WALLET_API_KEY });
      walletWorker = wallet.startRetryWorker();
+     buyerWorker = buyer.startWorker(pool, { wallet, walletBaseUrl: process.env.WALLET_BASE_URL,
+       onTick: () => walletWorker.wake(), publishOptions: { connectorUrl: CONNECTOR_URL } });
    } else {
      console.warn('[master] Falta WALLET_BASE_URL o WALLET_API_KEY: cliente de la wallet deshabilitado');
    }
