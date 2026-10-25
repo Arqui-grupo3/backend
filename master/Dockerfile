@@ -17,6 +17,7 @@ COPY market/ ./market/
 COPY effects/ ./effects/
 COPY seller/ ./seller/
 COPY buyer/ ./buyer/
+COPY config/ ./config/
 
 ENV PORT=3000
 EXPOSE 3000

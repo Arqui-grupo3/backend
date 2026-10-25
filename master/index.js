@@ -10,6 +10,7 @@ const market = require('./market');
 const seller = require('./seller');
 const buyer = require('./buyer/worker');
 const buyerConfig = require('./buyer/config');
+const strategyConfig = require('./config');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
@@ -308,7 +309,17 @@ app.post('/events', async (req, res) => {
       const generationCost = energy.generationCost || 0;
       // v3: la central informa los kWh vendibles acreditados en la wallet.
       const sellable = Number.isInteger(energy.sellable) ? energy.sellable : Math.floor(Math.max(0, capacity - consumption));
-      if (sellable > 0) {
+      // ADR 0006: se congela la configuración del ciclo. Si falla, no se vende este ciclo.
+      let cycleConfig = null;
+      try {
+        cycleConfig = await strategyConfig.freezeForCycle(pool, body.cycleId);
+      } catch (err) {
+        console.error(`[config] No se pudo congelar la configuración de ${body.cycleId}:`, err.message);
+      }
+      if (cycleConfig && !cycleConfig.marketEnabled) {
+        console.warn(`[config] Mercado apagado: no se publica oferta en ${body.cycleId}`);
+      }
+      if (sellable > 0 && cycleConfig?.marketEnabled) {
         // imbalancePrice viene en data.market y es 3 × el costo MÁS ALTO de todas las ciudades.
         let imbalancePrice = market.imbalancePrice;
         if (!Number.isFinite(imbalancePrice)) {
@@ -325,6 +336,8 @@ app.post('/events', async (req, res) => {
           lastBidAt: market.lastBidAt,
           closesAt: market.closesAt,
           walletAvailable: Boolean(wallet),
+          priceFactor: cycleConfig.priceFactor,
+          maxQuantity: cycleConfig.maxQuantity,
           connectorUrl: CONNECTOR_URL
         }).catch((err) => console.error('[seller] Error publicando oferta tras status-statement:', err.message));
       }
@@ -357,6 +370,54 @@ app.post('/events', async (req, res) => {
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el evento' });
+  }
+});
+
+// Configuración en caliente (ADR 0006). Sin interfaz: se usa con curl o Postman.
+app.get('/config', authenticate, async (req, res) => {
+  try {
+    res.json(await strategyConfig.getCurrent(pool));
+  } catch (err) {
+    console.error('[config] Error leyendo configuración:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.get('/config/history', authenticate, async (req, res) => {
+  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 20, 1), MAX_PAGE_LIMIT);
+  try {
+    res.json({ items: await strategyConfig.getHistory(pool, limit) });
+  } catch (err) {
+    console.error('[config] Error leyendo historial:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.get('/config/cycles/:cycleId', authenticate, async (req, res) => {
+  try {
+    const cfg = await strategyConfig.getForCycle(pool, req.params.cycleId);
+    if (!cfg) return res.status(404).json({ error: 'Ciclo sin configuración congelada' });
+    res.json(cfg);
+  } catch (err) {
+    console.error('[config] Error leyendo configuración del ciclo:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.put('/config', authenticate, async (req, res) => {
+  try {
+    const result = await strategyConfig.updateConfig(pool, req.body, { updatedBy: req.auth?.sub || null });
+    let withdrawn = [];
+    // Interruptor de emergencia: al apagar, se retiran altiro las ofertas activas.
+    if (result.previous.marketEnabled && !result.current.marketEnabled) {
+      withdrawn = await seller.withdrawActiveOffers(pool, { connectorUrl: CONNECTOR_URL });
+    }
+    console.log(`[config] Nueva versión ${result.current.version}`, JSON.stringify(req.body));
+    res.json({ ...result.current, withdrawnOffers: withdrawn.map((o) => o.offerId) });
+  } catch (err) {
+    if (err.statusCode === 422) return res.status(422).json({ error: err.message });
+    console.error('[config] Error actualizando configuración:', err.message);
+    res.status(500).json({ error: 'Error interno' });
   }
 });
 
