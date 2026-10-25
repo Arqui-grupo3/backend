@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
 const { Pool } = require('pg');
-const { recordMarketMessage, getActiveOffers } = require('../market');
+const { recordMarketMessage, getActiveOffers, getEffectiveOffers } = require('../market');
 
 if (!process.env.TEST_DATABASE_URL) throw Error('Define TEST_DATABASE_URL de pruebas');
 
@@ -14,6 +14,8 @@ async function fixture(t) {
   await admin.query(`CREATE SCHEMA ${schema}`);
   const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL, options: `-c search_path=${schema}` });
   t.after(async () => { await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end(); });
+  await pool.query(`CREATE TABLE events(id UUID PRIMARY KEY,idpk TEXT UNIQUE NOT NULL,msg_id UUID,type TEXT NOT NULL,
+    cycle_id TEXT,package_body JSONB,received_at TIMESTAMPTZ NOT NULL,seq BIGSERIAL);`);
   await pool.query(readFileSync(join(__dirname, '../migrations/007-market-feed.sql'), 'utf8'));
   return pool;
 }
@@ -76,4 +78,51 @@ test('market-closed cierra las ofertas del ciclo y el libro se ordena por precio
 test('un mensaje sin offerId se rechaza con 422', async (t) => {
   const pool = await fixture(t);
   await assert.rejects(recordMarketMessage(pool, { type: 'offer', cycleId: 'c', cityId: 'HGW', data: {} }), (err) => err.statusCode === 422);
+});
+
+test('precio efectivo usa ofertas del ciclo y la última tabla de rutas guardada', async (t) => {
+  const pool = await fixture(t);
+  await recordMarketMessage(pool, offer('HGW', 'HGW-1', 100, 300, 1));
+  await recordMarketMessage(pool, offer('MET', 'MET-1', 100, 330, 1));
+  await recordMarketMessage(pool, { ...offer('COR', 'COR-old', 100, 1, 1), cycleId: 'cycle-old' });
+
+  const distances = {
+    HGW: { distance: 100, transportCost: 0.1, enabled: true },
+    MET: { distance: 100, transportCost: 0.2, enabled: true },
+  };
+  const saveTable = (data, receivedAt) => pool.query(
+    `INSERT INTO events(id,idpk,msg_id,type,cycle_id,package_body,received_at)
+     VALUES ($1,$2,$3,'distance-table','cycle-1',$4,$5)`,
+    [randomUUID(), randomUUID(), randomUUID(), JSON.stringify(data), receivedAt]
+  );
+  await saveTable({
+    disabledRouteTransportCost: 6,
+    distances: { ...distances, COR: { distance: 1, transportCost: 0, enabled: true } },
+  }, at(10));
+
+  const options = { imbalancePrice: '1000.00' };
+  const before = await getEffectiveOffers(pool, 'cycle-1', options);
+  assert.deepEqual(before.map(o => [o.offerId, o.effectivePricePerEnergy]), [
+    ['HGW-1', '310.00'], ['MET-1', '350.00'],
+  ]);
+
+  // La última versión insertada manda por seq, aunque received_at sea anterior.
+  await saveTable({
+    disabledRouteTransportCost: 6,
+    distances: { ...distances, HGW: { ...distances.HGW, enabled: false } },
+  }, at(5));
+
+  const after = await getEffectiveOffers(pool, 'cycle-1', options);
+  assert.deepEqual(after.map(o => [o.offerId, o.effectivePricePerEnergy]), [
+    ['MET-1', '350.00'], ['HGW-1', '900.00'],
+  ]);
+  assert.equal(after[1].transportPerEnergy, '600.00');
+  assert.equal(after[1].routeEnabled, false);
+});
+
+test('sin tabla de rutas guardada no selecciona ofertas', async (t) => {
+  const pool = await fixture(t);
+  await recordMarketMessage(pool, offer('HGW', 'HGW-1', 100, 300, 1));
+
+  assert.deepEqual(await getEffectiveOffers(pool, 'cycle-1', { imbalancePrice: '735.00' }), []);
 });
