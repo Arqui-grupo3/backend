@@ -16,6 +16,7 @@ COPY wallet/ ./wallet/
 COPY market/ ./market/
 COPY effects/ ./effects/
 COPY seller/ ./seller/
+COPY config/ ./config/
 
 ENV PORT=3000
 EXPOSE 3000
