@@ -1,4 +1,5 @@
 const finite = (x) => typeof x === 'number' && Number.isFinite(x);
+const { rankOffers } = require('./selection')
 
 function fail(message) {
   const error = new Error(message);
@@ -116,4 +117,20 @@ async function getActiveOffers(db, cycleId) {
   return rows;
 }
 
-module.exports = { recordMarketMessage, getActiveOffers };
+async function getEffectiveOffers(db, cycleId, options){
+  const offers = await getActiveOffers(db, cycleId);
+
+  const { rows } = await db.query(`
+    SELECT package_body
+    FROM events
+    WHERE type = 'distance-table'
+    ORDER BY seq DESC
+    LIMIT 1
+  `);
+  if (rows.length === 0) return [];
+
+  return rankOffers(offers, rows[0].package_body, options);
+}
+
+
+module.exports = { recordMarketMessage, getActiveOffers, getEffectiveOffers };
