@@ -9,7 +9,6 @@ function fail(message, statusCode = 422) {
   throw error;
 }
 
-// Razones y códigos de bid-rejected según la referencia de la API v3.
 const BID_REJECTED_CODES = {
   QUANTITY_UNAVAILABLE: 409,
   OFFER_WITHDRAWN: 410,
@@ -17,9 +16,7 @@ const BID_REJECTED_CODES = {
   MARKET_CLOSED: 410,
   SELF_TRADE: 422
 };
-// Margen para que un swap no expire justo en el cierre del mercado.
 const CLOSE_MARGIN_MS = 2_000;
-// Un swap que vence en menos de esto no le da tiempo al comprador de aceptarlo.
 const MIN_SWAP_TTL_MS = 5_000;
 
 const toDate = (value) => {
@@ -85,6 +82,8 @@ async function publishSellerOffer(pool, {
   lastBidAt = null,
   closesAt = null,
   walletAvailable = true,
+  priceFactor = 0.85,
+  maxQuantity = null,
   now = () => Date.now(),
   connectorUrl = CONNECTOR_URL,
   fetchFn = globalThis.fetch
@@ -103,13 +102,16 @@ async function publishSellerOffer(pool, {
     return null;
   }
 
-  const pricePerEnergy = calculateSellerPrice({ generationCost, imbalancePrice });
+  // Configuración del ciclo (ADR 0006): tope de cantidad y factor de precio.
+  const quantity = Number.isInteger(maxQuantity) ? Math.min(sellable, maxQuantity) : sellable;
+  if (quantity <= 0) return null;
+  const pricePerEnergy = calculateSellerPrice({ generationCost, imbalancePrice, metDiscountFactor: priceFactor });
   const finalOfferId = offerId || `${cityId}-${cycleId}-offer`;
 
   await createSellerOffer(pool, {
     offerId: finalOfferId,
     cycleId,
-    totalQuantity: sellable,
+    totalQuantity: quantity,
     pricePerEnergy,
     cityId,
     minBid,
@@ -122,7 +124,7 @@ async function publishSellerOffer(pool, {
     cycleId,
     data: {
       offerId: finalOfferId,
-      quantity: sellable,
+      quantity,
       pricePerEnergy
     }
   };
@@ -136,7 +138,7 @@ async function publishSellerOffer(pool, {
   return {
     offerId: finalOfferId,
     cycleId,
-    quantity: sellable,
+    quantity,
     pricePerEnergy
   };
 }
@@ -230,6 +232,23 @@ async function publishOfferWithdrawn({
     console.error(`[seller] Error enviando offer-withdrawn para ${offerId}:`, err.message);
     return null;
   }
+}
+
+/**
+ * Interruptor de emergencia: retira las ofertas activas (las marca withdrawn y
+ * publica offer-withdrawn). Los bids que lleguen después se rechazan con
+ * OFFER_WITHDRAWN. Los swaps ya propuestos siguen su curso en la wallet.
+ */
+async function withdrawActiveOffers(pool, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const res = await pool.query(
+    `UPDATE seller_offers SET status = 'withdrawn', updated_at = now()
+     WHERE status = 'active'
+     RETURNING offer_id AS "offerId", cycle_id AS "cycleId"`
+  );
+  for (const offer of res.rows) {
+    await publishOfferWithdrawn({ ...offer, connectorUrl, fetchFn });
+  }
+  return res.rows;
 }
 
 /**
@@ -640,5 +659,6 @@ module.exports = {
   sendBidRejected,
   publishOfferUpdated,
   publishOfferWithdrawn,
+  withdrawActiveOffers,
   dispatchToConnector
 };
