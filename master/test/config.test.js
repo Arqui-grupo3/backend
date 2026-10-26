@@ -19,7 +19,7 @@ async function fixture(t) {
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
     await admin.end();
   });
-  for (const name of ['008-seller.sql', '009-seller-market-rules.sql', '010-strategy-config.sql']) {
+  for (const name of ['008-seller.sql', '009-seller-market-rules.sql', '010-strategy-config.sql', '013-seller-price-decay.sql']) {
     await pool.query(readFileSync(join(__dirname, '../migrations', name), 'utf8'));
   }
   return pool;
