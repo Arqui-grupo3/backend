@@ -17,8 +17,8 @@ const offers = [
 const table = {
   disabledRouteTransportCost: 6,
   distances: {
-    HGW: { distance: 100, transportCost: 1, enabled: true },
-    MET: { distance: 100, transportCost: 0.2, enabled: true },
+    HGW: { distance: 100000, transportCost: 1, enabled: true },
+    MET: { distance: 100000, transportCost: 0.2, enabled: true },
   },
 };
 
@@ -38,7 +38,7 @@ test('aplica tarifa punitiva multiplicada por distancia', () => {
     ...table,
     distances: {
       ...table.distances,
-      HGW: { distance: 50, transportCost: 1, enabled: false },
+      HGW: { distance: 50000, transportCost: 1, enabled: false },
     },
   };
 
@@ -76,10 +76,30 @@ test('excluye ofertas propias, agotadas o sin ruta conocida', () => {
 test('redondea correctamente el transporte a dos decimales', () => {
   const result = rankOffers([offer('HGW', '1.00')], {
     distances: {
-      HGW: { distance: 100.5, transportCost: 0.01, enabled: true },
+      HGW: { distance: 100500, transportCost: 0.01, enabled: true },
     },
   }, options);
 
   assert.equal(result[0].transportPerEnergy, '1.01');
   assert.equal(result[0].effectivePricePerEnergy, '2.01');
+});
+
+// Datos reales de producción: distance-table de la central y trade-recorded de la venta
+// REE→MET del ciclo 249226 (transportPerEnergy 6.59). La distancia viene en metros.
+test('con la distance-table real, el transporte MET→REE es 6.59 y la oferta de MET se compra', () => {
+  const real = {
+    disabledRouteTransportCost: 0.05, // valor de ejemplo: no se usa (rutas habilitadas)
+    distances: {
+      MET: { enabled: true, distance: 65880302, transportCost: 0.0001 },
+      KLD: { enabled: true, distance: 42193361, transportCost: 0.0175 },
+    },
+  };
+  const result = rankOffers([
+    { offerId: 'MET-249222', cityId: 'MET', quantity: 19175, remaining: 19175, pricePerEnergy: '49.52' },
+    { offerId: 'KLD-249222', cityId: 'KLD', quantity: 1000, remaining: 1000, pricePerEnergy: '10.00' },
+  ], real, { cityId: 'REE', imbalancePrice: 288.72 });
+
+  assert.deepEqual(result.map(o => [o.offerId, o.transportPerEnergy, o.effectivePricePerEnergy]), [
+    ['MET-249222', '6.59', '56.11'],
+  ], 'KLD queda en 10 + 738.38 > 288.72 y se descarta');
 });
