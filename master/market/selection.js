@@ -1,4 +1,5 @@
 const Decimal = require('decimal.js').clone({ precision: 40 });
+const METERS_PER_KM = 1000;
 
 function rankOffers(
     offers,
@@ -22,7 +23,10 @@ function rankOffers(
 
         if (rate == null) continue;
 
-        const transport = new Decimal(route.distance).times(rate).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+        // La central manda distance en metros y transportCost por km y kWh: transporte por
+        // kWh = distance / 1000 × costo. Confirmado con un trade-recorded real (MET→REE:
+        // distance 65880302 × 0.0001 / 1000 = 6.59 = transportPerEnergy de la central).
+        const transport = new Decimal(route.distance).div(METERS_PER_KM).times(rate).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
 
         const effective = new Decimal(offer.pricePerEnergy).plus(transport);
 
