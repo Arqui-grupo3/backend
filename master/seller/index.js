@@ -84,6 +84,7 @@ async function publishSellerOffer(pool, {
   walletAvailable = true,
   priceFactor = 0.85,
   maxQuantity = null,
+  priceDecayMinutes = 0,
   now = () => Date.now(),
   connectorUrl = CONNECTOR_URL,
   fetchFn = globalThis.fetch
@@ -106,6 +107,9 @@ async function publishSellerOffer(pool, {
   const quantity = Number.isInteger(maxQuantity) ? Math.min(sellable, maxQuantity) : sellable;
   if (quantity <= 0) return null;
   const pricePerEnergy = calculateSellerPrice({ generationCost, imbalancePrice, metDiscountFactor: priceFactor });
+  // Piso de la bajada: el mismo de calculateSellerPrice (1.05 × costo = recompra).
+  const floorPrice = round2(generationCost * 1.05);
+  const decayMinutes = Number.isInteger(priceDecayMinutes) && priceDecayMinutes > 0 ? priceDecayMinutes : 0;
   const finalOfferId = offerId || `${cityId}-${cycleId}-offer`;
 
   await createSellerOffer(pool, {
@@ -116,7 +120,11 @@ async function publishSellerOffer(pool, {
     cityId,
     minBid,
     lastBidAt,
-    closesAt
+    closesAt,
+    floorPrice,
+    decayMinutes,
+    lastOfferAt,
+    publishedAt: new Date(now())
   });
 
   const envelope = {
@@ -254,7 +262,8 @@ async function withdrawActiveOffers(pool, { connectorUrl = CONNECTOR_URL, fetchF
 /**
  * Registra o actualiza la oferta vendible del ciclo actual para nuestra ciudad.
  */
-async function createSellerOffer(pool, { offerId, cycleId, totalQuantity, pricePerEnergy, cityId = 'REE', minBid = null, lastBidAt = null, closesAt = null }) {
+async function createSellerOffer(pool, { offerId, cycleId, totalQuantity, pricePerEnergy, cityId = 'REE', minBid = null, lastBidAt = null, closesAt = null,
+  floorPrice = null, decayMinutes = 0, lastOfferAt = null, publishedAt = null }) {
   if (!offerId || typeof offerId !== 'string') fail('offerId requerido');
   if (!cycleId || typeof cycleId !== 'string') fail('cycleId requerido');
   if (!Number.isInteger(totalQuantity) || totalQuantity <= 0) fail('totalQuantity debe ser entero positivo');
@@ -263,8 +272,9 @@ async function createSellerOffer(pool, { offerId, cycleId, totalQuantity, priceP
   }
 
   const { rows } = await pool.query(
-    `INSERT INTO seller_offers (offer_id, cycle_id, city_id, total_quantity, price_per_energy, status, min_bid, last_bid_at, closes_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, now())
+    `INSERT INTO seller_offers (offer_id, cycle_id, city_id, total_quantity, price_per_energy, status, min_bid, last_bid_at, closes_at,
+                                start_price, floor_price, decay_minutes, last_offer_at, published_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $5, $9, $10, $11, $12, now())
      ON CONFLICT (offer_id) DO UPDATE SET
        total_quantity = EXCLUDED.total_quantity,
        price_per_energy = EXCLUDED.price_per_energy,
@@ -272,12 +282,20 @@ async function createSellerOffer(pool, { offerId, cycleId, totalQuantity, priceP
        min_bid = COALESCE(EXCLUDED.min_bid, seller_offers.min_bid),
        last_bid_at = COALESCE(EXCLUDED.last_bid_at, seller_offers.last_bid_at),
        closes_at = COALESCE(EXCLUDED.closes_at, seller_offers.closes_at),
+       start_price = EXCLUDED.start_price,
+       floor_price = EXCLUDED.floor_price,
+       decay_minutes = EXCLUDED.decay_minutes,
+       last_offer_at = COALESCE(EXCLUDED.last_offer_at, seller_offers.last_offer_at),
+       published_at = COALESCE(EXCLUDED.published_at, seller_offers.published_at),
        updated_at = now()
      RETURNING offer_id AS "offerId", cycle_id AS "cycleId", city_id AS "cityId",
                total_quantity AS "totalQuantity", price_per_energy::text AS "pricePerEnergy",
                status`,
     [offerId, cycleId, cityId, totalQuantity, round2(pricePerEnergy),
-      Number.isInteger(minBid) && minBid > 0 ? minBid : null, toDate(lastBidAt), toDate(closesAt)]
+      Number.isInteger(minBid) && minBid > 0 ? minBid : null, toDate(lastBidAt), toDate(closesAt),
+      Number.isFinite(floorPrice) && floorPrice > 0 ? round2(Math.min(floorPrice, pricePerEnergy)) : null,
+      Number.isInteger(decayMinutes) && decayMinutes > 0 ? decayMinutes : 0,
+      toDate(lastOfferAt), toDate(publishedAt)]
   );
   return rows[0];
 }
@@ -646,7 +664,95 @@ async function handleSwapReleased(pool, { swapIdpk, swapId, reason = 'SWAP_EXPIR
   return res.rows[0] || null;
 }
 
+/**
+ * Libera la cantidad de un swap que terminó sin liquidarse (vencido, cancelado o
+ * con el accept del comprador rechazado) y, si la oferta sigue activa, publica
+ * offer-updated con el remanente corregido para que los compradores lo vean.
+ */
+async function releaseSwap(pool, { swapIdpk = null, swapId = null, reason }, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const released = await handleSwapReleased(pool, { swapIdpk, swapId, reason });
+  if (!released) return null;
+  const offer = await getSellerOffer(pool, released.offerId);
+  if (offer && offer.status === 'active') {
+    await publishOfferUpdated({
+      offerId: offer.offerId,
+      cycleId: offer.cycleId,
+      remaining: offer.available,
+      pricePerEnergy: Number(offer.pricePerEnergy),
+      connectorUrl,
+      fetchFn
+    });
+  }
+  return released;
+}
+
+/**
+ * Bajada de precio durante el ciclo (ADR 0006). Cada minuto desde que se publicó,
+ * el precio baja en línea recta desde start_price hasta floor_price, al que llega
+ * en decay_minutes. No baja después de lastOfferAt (ya no se aceptan offer-updated)
+ * ni de una oferta retirada o agotada. Cada baja se publica con offer-updated.
+ *
+ * Se toma el mismo lock que processIncomingBid para que un bid no se reserve con
+ * un precio que ya se reemplazó. El UPDATE solo baja (price > nuevo), así que dos
+ * instancias o dos ticks seguidos no publican dos veces el mismo escalón.
+ */
+function decayedPrice({ startPrice, floorPrice, decayMinutes, publishedAt, at }) {
+  if (!(decayMinutes > 0) || !(startPrice > floorPrice)) return null;
+  const steps = Math.floor((at - publishedAt) / 60_000);
+  if (steps <= 0) return null;
+  const frac = Math.min(1, steps / decayMinutes);
+  return Math.max(floorPrice, round2(startPrice - (startPrice - floorPrice) * frac));
+}
+
+async function decayOfferPrices(pool, { now = () => Date.now(), connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const { rows } = await pool.query(
+    `SELECT offer_id AS "offerId", cycle_id AS "cycleId", price_per_energy::float8 AS price,
+            start_price::float8 AS "startPrice", floor_price::float8 AS "floorPrice",
+            decay_minutes AS "decayMinutes", published_at AS "publishedAt", last_offer_at AS "lastOfferAt"
+     FROM seller_offers
+     WHERE status = 'active' AND decay_minutes > 0 AND published_at IS NOT NULL
+       AND start_price IS NOT NULL AND floor_price IS NOT NULL AND price_per_energy > floor_price`
+  );
+  const changed = [];
+  for (const o of rows) {
+    const at = now();
+    if (o.lastOfferAt && at >= new Date(o.lastOfferAt).getTime()) continue;
+    const target = decayedPrice({ ...o, publishedAt: new Date(o.publishedAt).getTime(), at });
+    if (target === null || target >= o.price) continue;
+
+    const client = await pool.connect();
+    let updated = false;
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [o.offerId]);
+      const res = await client.query(
+        `UPDATE seller_offers SET price_per_energy = $2, updated_at = now()
+         WHERE offer_id = $1 AND status = 'active' AND price_per_energy > $2`,
+        [o.offerId, target]
+      );
+      await client.query('COMMIT');
+      updated = res.rowCount > 0;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    if (!updated) continue;
+
+    const offer = await getSellerOffer(pool, o.offerId);
+    if (offer && offer.available > 0) {
+      await publishOfferUpdated({ offerId: o.offerId, cycleId: o.cycleId, remaining: offer.available, pricePerEnergy: target, connectorUrl, fetchFn });
+    }
+    changed.push({ offerId: o.offerId, pricePerEnergy: target });
+  }
+  return changed;
+}
+
 module.exports = {
+  decayedPrice,
+  decayOfferPrices,
+  releaseSwap,
   createSellerOffer,
   getSellerOffer,
   processIncomingBid,
