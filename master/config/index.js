@@ -1,6 +1,6 @@
 // Configuración en caliente de la estrategia (ADR 0006).
 // - Cada cambio crea una versión nueva en strategy_config.
-// - Precio, cantidad y span se congelan por ciclo al llegar el status-statement:
+// - Precio, cantidad, span y bajada de precio se congelan por ciclo al llegar el status-statement:
 //   un cambio a mitad de ciclo rige desde el ciclo siguiente.
 // - marketEnabled es el interruptor de emergencia: se lee en vivo y rige altiro.
 
@@ -8,13 +8,15 @@ const FIELDS = {
   marketEnabled: 'market_enabled',
   priceFactor: 'price_factor',
   maxQuantity: 'max_quantity',
-  spanSeconds: 'span_seconds'
+  spanSeconds: 'span_seconds',
+  priceDecayMinutes: 'price_decay_minutes'
 };
 
 function columns(t = '') {
   const p = t ? `${t}.` : '';
   return `${p}version, ${p}market_enabled AS "marketEnabled", ${p}price_factor::float8 AS "priceFactor",
-  ${p}max_quantity AS "maxQuantity", ${p}span_seconds AS "spanSeconds", ${p}updated_by AS "updatedBy",
+  ${p}max_quantity AS "maxQuantity", ${p}span_seconds AS "spanSeconds",
+  ${p}price_decay_minutes AS "priceDecayMinutes", ${p}updated_by AS "updatedBy",
   ${p}note, ${p}created_at AS "createdAt"`;
 }
 const SELECT = columns();
@@ -50,8 +52,13 @@ function validatePatch(body) {
     if (!Number.isInteger(v) || v < 0 || v > 540) fail('spanSeconds debe ser un entero entre 0 y 540 (antes de lastBidAt)');
     patch.spanSeconds = v;
   }
+  if ('priceDecayMinutes' in body) {
+    const v = body.priceDecayMinutes;
+    if (!Number.isInteger(v) || v < 0 || v > 8) fail('priceDecayMinutes debe ser un entero entre 0 (precio fijo) y 8');
+    patch.priceDecayMinutes = v;
+  }
   if ('note' in body && body.note !== null && typeof body.note !== 'string') fail('note debe ser texto');
-  if (!Object.keys(patch).length) fail('No hay cambios: envía al menos uno de marketEnabled, priceFactor, maxQuantity o spanSeconds');
+  if (!Object.keys(patch).length) fail('No hay cambios: envía al menos uno de marketEnabled, priceFactor, maxQuantity, spanSeconds o priceDecayMinutes');
   return { patch, note: typeof body.note === 'string' ? body.note.slice(0, 500) : null };
 }
 
@@ -76,9 +83,9 @@ async function updateConfig(pool, body, { updatedBy = null } = {}) {
     const current = (await client.query(`SELECT ${SELECT} FROM strategy_config ORDER BY version DESC LIMIT 1`)).rows[0];
     const next = { ...current, ...patch };
     const res = await client.query(
-      `INSERT INTO strategy_config (market_enabled, price_factor, max_quantity, span_seconds, updated_by, note)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING ${SELECT}`,
-      [next.marketEnabled, next.priceFactor, next.maxQuantity, next.spanSeconds, updatedBy, note]
+      `INSERT INTO strategy_config (market_enabled, price_factor, max_quantity, span_seconds, price_decay_minutes, updated_by, note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${SELECT}`,
+      [next.marketEnabled, next.priceFactor, next.maxQuantity, next.spanSeconds, next.priceDecayMinutes, updatedBy, note]
     );
     await client.query('COMMIT');
     return { previous: current, current: res.rows[0] };

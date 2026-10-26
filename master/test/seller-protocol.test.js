@@ -287,3 +287,41 @@ test('9: la oferta no se publica después de lastOfferAt', async (t) => {
   });
   assert.equal(ok.pricePerEnergy, 624.75, '0.85 × imbalancePrice real (735)');
 });
+
+// Caso visto en producción (ciclo 249207): MET manda un bid por minuto, nosotros
+// proponemos, pero la wallet rechaza su accept con INSUFFICIENT_ASSET y deja el swap
+// 'rejected'. Antes la reserva quedaba en 'proposed' y el remanente se achicaba solo.
+test('accept rechazado del comprador: se libera la reserva y se republica el remanente', async (t) => {
+  const pool = await fixture(t);
+  const { incoming, decision } = await bidPropuesto(pool);
+  await seller.handleSwapProposed(pool, { data: { swapId: 'swp-acc', idpk: decision.swapIdpk, token: 't', expiresAt: '2030-01-01T12:00:45Z' } }, { fetchFn: fakeFetch() });
+  assert.equal(await disponible(pool), 600);
+
+  const fetchFn = fakeFetch();
+  const released = await seller.releaseSwap(pool, { swapId: 'swp-acc', reason: 'ACCEPT_REJECTED' }, { fetchFn });
+  assert.ok(released);
+  assert.equal(await estado(pool, incoming.idpk), 'released');
+  assert.equal(await disponible(pool), 1000, 'la cantidad vuelve a estar disponible');
+  assert.equal(fetchFn.sent.length, 1);
+  assert.equal(fetchFn.sent[0].type, 'offer-updated');
+  assert.equal(fetchFn.sent[0].data.remaining, 1000);
+});
+
+test('releaseSwap de un swap que no es nuestro no libera ni publica nada', async (t) => {
+  const pool = await fixture(t);
+  await bidPropuesto(pool);
+  const fetchFn = fakeFetch();
+  assert.equal(await seller.releaseSwap(pool, { swapId: 'swap-de-otro', reason: 'ACCEPT_REJECTED' }, { fetchFn }), null);
+  assert.equal(fetchFn.sent.length, 0);
+  assert.equal(await disponible(pool), 600);
+});
+
+test('releaseSwap tras liquidarse no devuelve cantidad', async (t) => {
+  const pool = await fixture(t);
+  const { incoming, decision } = await bidPropuesto(pool);
+  await seller.handleSwapProposed(pool, { data: { swapId: 'swp-ok', idpk: decision.swapIdpk, token: 't', expiresAt: '2030-01-01T12:00:45Z' } }, { fetchFn: fakeFetch() });
+  await seller.handleSwapSettled(pool, { swapId: 'swp-ok' });
+  assert.equal(await seller.releaseSwap(pool, { swapId: 'swp-ok', reason: 'ACCEPT_REJECTED' }, { fetchFn: fakeFetch() }), null);
+  assert.equal(await estado(pool, incoming.idpk), 'settled');
+  assert.equal(await disponible(pool), 600);
+});

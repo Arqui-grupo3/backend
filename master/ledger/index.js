@@ -40,7 +40,7 @@ async function migrate(pool) {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(2173, 1)');
     await client.query('CREATE TABLE IF NOT EXISTS ledger_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())');
-    for (const name of ['001-ledger.sql', '002-demand.sql', '003-reports.sql', '004-negotiations.sql', '005-wallet-ops.sql', '006-wallet-effects.sql', '007-market-feed.sql', '008-seller.sql', '009-seller-market-rules.sql', '010-buyer.sql', '011-buyer-bid-attempts.sql', '012-buyer-automation.sql', '010-strategy-config.sql']) {
+    for (const name of ['001-ledger.sql', '002-demand.sql', '003-reports.sql', '004-negotiations.sql', '005-wallet-ops.sql', '006-wallet-effects.sql', '007-market-feed.sql', '008-seller.sql', '009-seller-market-rules.sql', '010-buyer.sql', '011-buyer-bid-attempts.sql', '012-buyer-automation.sql', '010-strategy-config.sql', '013-seller-price-decay.sql']) {
       const applied = await client.query('SELECT 1 FROM ledger_migrations WHERE name=$1', [name]);
       if (!applied.rowCount) {
         await client.query(readFileSync(join(__dirname, '../migrations', name), 'utf8'));

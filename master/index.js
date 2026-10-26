@@ -338,6 +338,7 @@ app.post('/events', async (req, res) => {
           walletAvailable: Boolean(wallet),
           priceFactor: cycleConfig.priceFactor,
           maxQuantity: cycleConfig.maxQuantity,
+          priceDecayMinutes: cycleConfig.priceDecayMinutes,
           connectorUrl: CONNECTOR_URL
         }).catch((err) => console.error('[seller] Error publicando oferta tras status-statement:', err.message));
       }
@@ -355,11 +356,20 @@ app.post('/events', async (req, res) => {
       // del mensaje). Si no tiene formato UUID (p. ej. la de la central), se ignora.
       const swapId = body.data?.swapId;
       const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
-      await seller.handleSwapReleased(pool, { swapId, swapIdpk, reason: type }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
+      await seller.releaseSwap(pool, { swapId, swapIdpk, reason: type }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
+    } else if (type === 'swap-rejected' && body.data?.operation === 'accept') {
+      // La wallet rechazó el accept del comprador (p. ej. INSUFFICIENT_ASSET: no le
+      // alcanzó el CR). Verificado en producción con GET /swaps/{id}: el swap queda
+      // 'rejected' (terminal) y la wallet ya liberó los kWh retenidos. Si no se libera
+      // aquí, la reserva local queda colgada y el remanente de la oferta se achica con
+      // cada reintento del comprador. data.idpk es la llave del comprador: se usa swapId.
+      const swapId = body.data?.swapId;
+      if (swapId) {
+        console.warn(`[seller] El comprador no pudo aceptar ${swapId}: ${body.reason || body.data?.message || 'swap-rejected'}`);
+        await seller.releaseSwap(pool, { swapId, reason: 'ACCEPT_REJECTED' }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected (accept) handler error:', e.message));
+      }
     } else if (type === 'swap-rejected' && body.data?.operation === 'propose') {
-      // Solo un rechazo de NUESTRA propuesta libera la cantidad. Un swap-rejected de un
-      // accept (al comprador le faltó algo) no cierra el swap: la wallet sigue reteniendo
-      // los kWh hasta que expire o se cancele (error 5). Puede no traer swapId.
+      // Rechazo de NUESTRA propuesta: el swap no llegó a existir. Puede no traer swapId.
       const swapId = body.data?.swapId;
       const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
       await seller.handleProposalRejected(pool, { swapId, swapIdpk }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected handler error:', e.message));
@@ -791,6 +801,14 @@ initDb().then(() => {
    } else {
      console.warn('[master] Falta WALLET_BASE_URL o WALLET_API_KEY: cliente de la wallet deshabilitado');
    }
+
+  // Bajada de precio de nuestra oferta durante el ciclo (ADR 0006). Cada 5 s revisa si
+  // toca un escalón nuevo; el escalón real es de 1 minuto (seller.decayOfferPrices).
+  setInterval(() => {
+    seller.decayOfferPrices(pool, { connectorUrl: CONNECTOR_URL })
+      .then((changed) => changed.forEach((c) => console.log(`[seller] Precio de ${c.offerId} baja a ${c.pricePerEnergy}`)))
+      .catch((err) => console.error('[seller] Error bajando precio:', err.message));
+  }, 5000).unref();
 
   app.listen(PORT, () => {
     console.log(`[master] Escuchando en http://localhost:${PORT}`);
