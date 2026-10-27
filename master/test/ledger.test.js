@@ -194,3 +194,30 @@ test('API + worker + publisher HTTP: opensAt sobrevive al reinicio y conserva id
   const health=await (await fetch(base+'/health')).json();assert.equal(health.reporter.enabled,true);
   await stopServer();await startServer();
 });
+
+test('API: distance-table y connectivity respetan publicación sin cambiar sus campos', async () => {
+  assert.equal((await fetch(base + '/distance-table')).status, 404);
+  assert.equal(await (await fetch(base + '/connectivity')).json(), null);
+
+  const routeData = rate => ({
+    disabledRouteTransportCost: 10,
+    distances: { HGW: { enabled: true, distance: 1000, transportCost: rate } },
+  });
+  const newer = message('distance-table', 'routes', routeData(2), {
+    timestamp: '2026-10-27T16:00:20Z',
+  });
+  const older = message('distance-table', 'routes', routeData(1), {
+    timestamp: '2026-10-27T16:00:10Z',
+  });
+  assert.equal((await post(newer)).status, 201);
+  assert.equal((await post(older)).status, 201);
+
+  const distance = await (await fetch(base + '/distance-table')).json();
+  const connectivity = await (await fetch(base + '/connectivity')).json();
+  assert.equal(distance.idpk, newer.idpk);
+  assert.equal(distance.data.distances.HGW.transportCost, 2);
+  assert.equal(connectivity.id, distance.id);
+  assert.deepEqual(connectivity.data, distance.data);
+  assert.deepEqual(Object.keys(distance).sort(), ['data', 'id', 'idpk', 'receivedAt', 'type']);
+  assert.deepEqual(Object.keys(connectivity).sort(), ['cycleId', 'data', 'id', 'receivedAt']);
+});

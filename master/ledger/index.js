@@ -13,6 +13,7 @@ function validate(event) {
     fail('Se requieren idpk y type.');
   }
   if (event.receivedAt !== undefined && !timestamp(event.receivedAt)) fail('receivedAt invalido.');
+  if (event.type === 'distance-table' && !timestamp(event.timestamp)) fail('distance-table requiere timestamp ISO válido.');
   if (!ledgerTypes.has(event.type)) return;
   if (!uuid.test(event.idpk) || !uuid.test(event.msgId || '') || event.idpk.toLowerCase() === event.msgId.toLowerCase()) fail('idpk y msgId deben ser UUID distintos.');
   if (!timestamp(event.timestamp) || typeof event.cycleId !== 'string' || !event.cycleId.trim()) fail('timestamp y cycleId requeridos.');
@@ -57,10 +58,9 @@ async function recordEvent(pool, event) {
   const client = await pool.connect();
   const idpk = uuid.test(event.idpk) ? event.idpk.toLowerCase() : event.idpk;
   const receivedAt = event.receivedAt || new Date().toISOString();
+  const publishedAt = timestamp(event.timestamp) ? event.timestamp : null;
   try {
     await client.query('BEGIN');
-    // Serialize application order, not just allocation of sequence numbers.
-    // Also makes concurrent redelivery and legacy uppercase UUIDs safe.
     await client.query('SELECT pg_advisory_xact_lock(2173, 1)');
     const existing = await client.query('SELECT id FROM events WHERE lower(idpk) = lower($1) LIMIT 1', [idpk]);
     if (existing.rowCount) {
@@ -72,9 +72,9 @@ async function recordEvent(pool, event) {
       return { inserted: false, id: existing.rows[0].id, receivedAt };
     }
     const id = randomUUID();
-    await client.query(`INSERT INTO events (id,idpk,msg_id,type,cycle_id,package_body,received_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-    [id, idpk, event.msgId ?? null, event.type, event.cycleId ?? null, event.data ?? event.packageBody ?? {}, receivedAt]);
+    await client.query(`INSERT INTO events (id,idpk,msg_id,type,cycle_id,package_body,received_at,published_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+    [id, idpk, event.msgId ?? null, event.type, event.cycleId ?? null, event.data ?? event.packageBody ?? {}, receivedAt, publishedAt]);
     if (ledgerTypes.has(event.type)) {
       await client.query(`INSERT INTO ledger_events (id,idpk,msg_id,cycle_id,type,payload,envelope,occurred_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
