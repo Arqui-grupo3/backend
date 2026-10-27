@@ -1,6 +1,15 @@
 const Decimal = require('decimal.js').clone({ precision: 40 });
 const { randomUUID } = require('node:crypto');
 
+// Interruptor del mercado (marketEnabled de /config), leído en vivo. El lock compartido
+// lo serializa con updateConfig (que toma el mismo lock exclusivo): un cambio a apagado no
+// se cruza con una reserva o un envío en curso.
+async function marketEnabled(client) {
+  await client.query('SELECT pg_advisory_xact_lock_shared(2173, 6)');
+  const { rows } = await client.query('SELECT market_enabled FROM strategy_config ORDER BY version DESC LIMIT 1');
+  return rows[0]?.market_enabled ?? false;
+}
+
 async function initializeCycle(db, event) {
   const { energy, market } = event.data;
 
@@ -9,8 +18,19 @@ async function initializeCycle(db, event) {
     new Decimal(energy.consumption).minus(energy.generationCapacity)
   ).ceil().toNumber();
 
+  // Una sola configuración (ADR 0006): se congela la versión de strategy_config del ciclo
+  // (la misma que usa el vendedor) y el span sale de ahí.
+  await db.query(
+    `INSERT INTO cycle_config (cycle_id, config_version)
+     SELECT $1, MAX(version) FROM strategy_config
+     ON CONFLICT (cycle_id) DO NOTHING`,
+    [event.cycleId]
+  );
   const config = (await db.query(
-    'SELECT id, span_seconds FROM strategy_versions ORDER BY id DESC LIMIT 1'
+    `SELECT s.version AS id, s.span_seconds
+     FROM cycle_config c JOIN strategy_config s ON s.version = c.config_version
+     WHERE c.cycle_id = $1`,
+    [event.cycleId]
   )).rows[0];
   const buyAt = market.opensAt
     ? new Date(Date.parse(market.opensAt) + config.span_seconds * 1000)
@@ -19,7 +39,7 @@ async function initializeCycle(db, event) {
   const result = await db.query(
     `INSERT INTO buyer_cycles (
        cycle_id, deficit_kwh, last_bid_at, closes_at,
-       strategy_version, buy_at, imbalance_price, min_bid
+       config_version, buy_at, imbalance_price, min_bid
      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
      ON CONFLICT (cycle_id) DO NOTHING`,
     [event.cycleId, deficit, market.lastBidAt, market.closesAt,
@@ -42,8 +62,7 @@ async function reserveBid(pool, { cycleId, offer, quantity, minBid }) {
 
   try {
     await client.query('BEGIN');
-    const control = (await client.query('SELECT enabled FROM buyer_control FOR SHARE')).rows[0];
-    if (!control.enabled) {
+    if (!(await marketEnabled(client))) {
       await client.query('COMMIT');
       return null;
     }
@@ -141,8 +160,7 @@ async function publishBid(pool, idpk, {
 
   try {
     await client.query('BEGIN');
-    const control = (await client.query('SELECT enabled FROM buyer_control FOR SHARE')).rows[0];
-    if (!control.enabled) {
+    if (!(await marketEnabled(client))) {
       await client.query('COMMIT');
       return null;
     }
@@ -240,4 +258,4 @@ async function publishBid(pool, idpk, {
   }
 }
 
-module.exports = { initializeCycle, reserveBid, publishBid };
+module.exports = { initializeCycle, reserveBid, publishBid, marketEnabled };

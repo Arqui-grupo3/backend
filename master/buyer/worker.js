@@ -59,7 +59,7 @@ async function runOnce(pool, { wallet, verifyToken, cityId = process.env.CITY_ID
       FROM buyer_cycles c WHERE b.cycle_id=c.cycle_id AND b.status IN ('reserved','sent')
       AND c.closes_at <= clock_timestamp()`);
 
-    const enabled = (await pool.query('SELECT enabled FROM buyer_control')).rows[0].enabled;
+    const enabled = (await pool.query('SELECT market_enabled AS enabled FROM strategy_config ORDER BY version DESC LIMIT 1')).rows[0]?.enabled ?? false;
     if (!enabled) return false; // Lo pendiente anterior se sigue resolviendo arriba.
 
     // Como máximo un envío del comprador cada 2 s, incluso con muchos wake().

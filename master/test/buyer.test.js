@@ -17,6 +17,10 @@ async function fixture(t) {
   await pool.query(readFileSync(join(__dirname, '../migrations/010-buyer.sql'), 'utf8'));
   await pool.query(readFileSync(join(__dirname, '../migrations/011-buyer-bid-attempts.sql'), 'utf8'));
   await pool.query(readFileSync(join(__dirname, '../migrations/012-buyer-automation.sql'), 'utf8'));
+  // El comprador usa la configuración única (strategy_config) desde la migración 014.
+  for (const name of ['008-seller.sql', '009-seller-market-rules.sql', '010-strategy-config.sql', '013-seller-price-decay.sql', '014-unificar-config.sql']) {
+    await pool.query(readFileSync(join(__dirname, '../migrations', name), 'utf8'));
+  }
   return pool;
 }
 
