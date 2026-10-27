@@ -235,12 +235,19 @@ app.get('/buyer/config', authenticate, async (req, res) => {
   try { res.json(await buyerConfig.getConfig(pool)); }
   catch (error) { res.status(500).json({ error: error.message }); }
 });
+// Alias de /config (ADR 0006): spanSeconds y enabled (= marketEnabled) quedan en la misma
+// configuración versionada que usa el vendedor. Apagar aquí apaga también al vendedor.
 app.put('/buyer/config', authenticate, async (req, res) => {
   try {
-    const config = await buyerConfig.setConfig(pool, req.body);
+    const { previous, ...config } = await buyerConfig.setConfig(pool, req.body);
+    let withdrawn = [];
+    if (previous.enabled && !config.enabled) {
+      withdrawn = await seller.withdrawActiveOffers(pool, { connectorUrl: CONNECTOR_URL });
+    }
     buyerWorker?.wake();
-    res.json(config);
-  } catch (error) { res.status(error.statusCode || 500).json({ error: error.message }); }
+    console.log(`[config] Nueva versión ${config.version} vía /buyer/config`, JSON.stringify(req.body));
+    res.json({ ...config, withdrawnOffers: withdrawn.map((o) => o.offerId) });
+  } catch (error) { res.status(error.statusCode || 500).json({ error: error.statusCode === 422 ? error.message : 'Error interno' }); }
 });
 
 app.post('/seller/offer', async (req, res) => {
@@ -422,6 +429,7 @@ app.put('/config', authenticate, async (req, res) => {
     if (result.previous.marketEnabled && !result.current.marketEnabled) {
       withdrawn = await seller.withdrawActiveOffers(pool, { connectorUrl: CONNECTOR_URL });
     }
+    buyerWorker?.wake();
     console.log(`[config] Nueva versión ${result.current.version}`, JSON.stringify(req.body));
     res.json({ ...result.current, withdrawnOffers: withdrawn.map((o) => o.offerId) });
   } catch (err) {
