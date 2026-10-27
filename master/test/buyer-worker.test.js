@@ -154,7 +154,7 @@ test('buyer worker: un rechazo libera déficit y elige otra oferta disponible', 
   await f.tick();
   await recordMarketMessage(f.pool, envelope('offer-updated', { offerId: 'MET-1', remaining: 100, pricePerEnergy: 0 }, { cityId: 'MET' }));
   await recordEvent(f.pool, envelope('bid-rejected', { target: f.published[0].msgId,
-    offerId: 'HGW-1', requested: 26 }, { sender: undefined, cityId: 'HGW', reason: 'QUANTITY_UNAVAILABLE', code: 409 }));
+    offerId: 'HGW-1', requested: 26, available: 0 }, { sender: undefined, cityId: 'HGW', reason: 'QUANTITY_UNAVAILABLE', code: 409 }));
   await f.pool.query("UPDATE buyer_bid_attempts SET started_at=clock_timestamp()-interval '31 seconds'");
   await f.tick();
   assert.equal((await bidState(f.pool)).status, 'rejected');
