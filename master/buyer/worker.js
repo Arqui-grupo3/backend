@@ -55,8 +55,8 @@ async function runOnce(pool, { wallet, verifyToken, cityId = process.env.CITY_ID
       FROM buyer_cycles c WHERE b.cycle_id=c.cycle_id AND b.status IN ('reserved','sent')
       AND c.closes_at <= clock_timestamp()`);
 
-    const enabled = (await pool.query('SELECT enabled FROM buyer_control')).rows[0].enabled;
-    if (!enabled) return false;
+    const enabled = (await pool.query('SELECT market_enabled AS enabled FROM strategy_config ORDER BY version DESC LIMIT 1')).rows[0]?.enabled ?? false;
+    if (!enabled) return false; // Lo pendiente anterior se sigue resolviendo arriba.
 
     const recent = await pool.query(`SELECT 1 FROM buyer_bid_attempts
       WHERE started_at > clock_timestamp()-interval '2 seconds' LIMIT 1`);
