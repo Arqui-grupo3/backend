@@ -5,7 +5,7 @@ const { Pool } = require('pg');
 const { migrate, recordEvent } = require('../ledger');
 const { recordMarketMessage } = require('../market');
 const { runOnce, startWorker, _resetBudgetCache } = require('../buyer/worker');
-const { affordableQuantity } = require('../buyer/budget');
+const { affordableQuantity, committedCredits } = require('../buyer/budget');
 const { getConfig, setConfig } = require('../buyer/config');
 const { createTokenVerifier, InvalidSwapToken } = require('../buyer/token');
 const { createWalletClient } = require('../wallet');
@@ -35,7 +35,7 @@ const settled = (idpk, extra = {}) => envelope('swap-settled', {
   settledAt: new Date().toISOString(), ...extra,
 });
 
-async function fixture(t, { opensAt = Date.now() - 421000, cycleId = 'cycle-1' } = {}) {
+async function fixture(t, { opensAt = Date.now() - 421000, cycleId = 'cycle-1', consumption = 125.2 } = {}) {
   const schema = 'buyer_worker_' + randomUUID().replaceAll('-', '');
   const admin = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
   await admin.query(`CREATE SCHEMA ${schema}`);
@@ -47,7 +47,7 @@ async function fixture(t, { opensAt = Date.now() - 421000, cycleId = 'cycle-1' }
     reason TEXT,details JSONB,received_at TIMESTAMPTZ,seq BIGSERIAL);`);
   await migrate(pool);
   const status = envelope('status-statement', {
-    energy: { generationCapacity: 100, consumption: 125.2, generationCost: 2, sellable: 0 },
+    energy: { generationCapacity: 100, consumption, generationCost: 2, sellable: 0 },
     market: { opensAt: new Date(opensAt).toISOString(), lastBidAt: new Date(Date.now() + 120000).toISOString(),
       closesAt: new Date(Date.now() + 180000).toISOString(), imbalancePrice: 20, minBid: 10 },
     validUntil: new Date(Date.now() + 480000).toISOString(),
@@ -492,4 +492,139 @@ test('buyer: no crea el segundo pedido después de lastBidAt', async t => {
 
   assert.equal(await f.tick(), false);
   assert.equal(f.published.length, 1);
+});
+
+test('buyer budget: incluye transporte al planificar dos compras', async t => {
+  _resetBudgetCache();
+  const f = await fixture(t, { consumption: 200 });
+  f.snapshot(balance(1000, 0));
+
+  await recordEvent(f.pool, envelope('distance-table', {
+    disabledRouteTransportCost: 100,
+    distances: {
+      HGW: { enabled: true, distance: 2000, transportCost: 1 },
+      MET: { enabled: true, distance: 2000, transportCost: 1 },
+    },
+  }));
+
+  for (const [cityId, remaining, pricePerEnergy] of [
+    ['HGW', 50, 10],
+    ['MET', 100, 11],
+  ]) {
+    await recordMarketMessage(f.pool, envelope('offer-updated', {
+      offerId: `${cityId}-1`,
+      remaining,
+      pricePerEnergy,
+    }, { sender: undefined, cityId }));
+  }
+
+  assert.equal(await f.tick(), true);
+  assert.deepEqual(f.published[0].data, { offerId: 'HGW-1', quantity: 50 });
+  assert.equal((await committedCredits(f.pool)).toFixed(2), '600.00');
+
+  await allowNextBid(f.pool);
+
+  assert.equal(await f.tick(), true);
+  assert.deepEqual(f.published[1].data, { offerId: 'MET-1', quantity: 30 });
+  assert.equal((await committedCredits(f.pool)).toFixed(2), '990.00');
+});
+
+test('buyer budget: cuenta solo compromisos pendientes', async t => {
+  const f = await fixture(t);
+  await f.tick();
+
+  for (const status of ['reserved', 'sent', 'accepted']) {
+    await f.pool.query('UPDATE buyer_bids SET status=$1', [status]);
+    assert.equal((await committedCredits(f.pool)).toFixed(2), '312.00');
+  }
+
+  for (const status of ['settled', 'rejected', 'released']) {
+    await f.pool.query('UPDATE buyer_bids SET status=$1', [status]);
+    assert.equal((await committedCredits(f.pool)).toFixed(2), '0.00');
+  }
+});
+
+test('buyer budget: recalcula transporte punitivo aunque exceda el techo de compras nuevas', async t => {
+  const f = await fixture(t);
+  await f.tick();
+
+  await recordEvent(f.pool, envelope('distance-table', {
+    disabledRouteTransportCost: 10,
+    distances: {
+      HGW: { enabled: false, distance: 2000, transportCost: 1 },
+    },
+  }));
+
+  // 26 × (10 de energía + 2 km × 10 de transporte).
+  assert.equal((await committedCredits(f.pool)).toFixed(2), '780.00');
+});
+
+test('buyer budget: no supone transporte cero si falta una ruta', async t => {
+  const f = await fixture(t);
+  await f.tick();
+
+  await recordEvent(f.pool, envelope('distance-table', {
+    disabledRouteTransportCost: 100,
+    distances: {
+      MET: { enabled: true, distance: 2000, transportCost: 1 },
+    },
+  }));
+
+  await assert.rejects(
+    committedCredits(f.pool),
+    /No se puede estimar el transporte pendiente desde HGW/
+  );
+});
+
+test('buyer: revalida el accept con la última publicación aunque una tabla vieja llegue después', async t => {
+  const f = await fixture(t);
+  await f.tick();
+
+  const base = Date.now();
+  const routes = transportCost => ({
+    disabledRouteTransportCost: 100,
+    distances: { HGW: { enabled: true, distance: 2000, transportCost } },
+  });
+
+  await recordEvent(f.pool, envelope('distance-table', routes(1), {
+    timestamp: new Date(base + 1).toISOString(),
+  }));
+  await recordEvent(f.pool, envelope('distance-table', routes(100), {
+    timestamp: new Date(base).toISOString(),
+  }));
+  await recordEvent(f.pool, accepted(f.published[0].msgId));
+
+  await f.tick();
+
+  assert.equal((await bidState(f.pool)).status, 'accepted');
+});
+
+test('buyer: registra el transporte real sin recalcularlo con una ruta posterior', async t => {
+  const f = await fixture(t);
+  await f.tick();
+  await recordEvent(f.pool, accepted(f.published[0].msgId));
+  await f.tick();
+  const bid = await bidState(f.pool);
+  await recordEvent(f.pool, settled(bid.accept_idpk));
+
+  await recordEvent(f.pool, envelope('distance-table', {
+    disabledRouteTransportCost: 100,
+    distances: { HGW: { enabled: false, distance: 2000, transportCost: 1 } },
+  }));
+  await recordEvent(f.pool, envelope('trade-recorded', {
+    swapId: 'swp-test',
+    buyer: 'REE',
+    seller: 'HGW',
+    quantity: 26,
+    pricePerEnergy: 10,
+    energyTotal: 260,
+    transportPerEnergy: 2,
+    transportTotal: 52,
+    routeEnabled: true,
+  }));
+
+  const { rows } = await f.pool.query(
+    "SELECT amount::text FROM wallet_effects WHERE effect_key='transport:swp-test'"
+  );
+  assert.equal(rows[0].amount, '-52.00');
 });
