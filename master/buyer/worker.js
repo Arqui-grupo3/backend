@@ -2,6 +2,12 @@ const { reserveBid, publishBid } = require('./index');
 const { getEffectiveOffers } = require('../market');
 const { createTokenVerifier } = require('./token');
 const { onEvent, processResponse } = require('./responses');
+const { maxAffordable } = require('./budget');
+
+// Cuando el saldo no alcanza ni para minBid, se avisa una vez por ciclo y no se vuelve a
+// consultar /balance hasta 30 s después (la wallet es lenta y el worker corre cada segundo).
+const noBudgetUntil = new Map();
+const NO_BUDGET_RETRY_MS = 30_000;
 
 async function reconcile(pool, wallet, cityId) {
   // Un 202 o un timeout siguen comprometidos hasta conocer el resultado.
@@ -86,8 +92,23 @@ async function runOnce(pool, { wallet, verifyToken, cityId = process.env.CITY_ID
       { cityId, imbalancePrice: cycle.imbalance_price });
     const offer = offers.find(o => !attempted.has(o.offerId) && (o.remaining ?? o.quantity) >= cycle.min_bid);
     if (!offer) return false;
+    // Limita la compra a lo que alcanza a pagar dentro de la línea de crédito.
+    let quantity = cycle.deficit_kwh;
+    if ((noBudgetUntil.get(cycle.cycle_id) || 0) > Date.now()) return false;
+    const affordable = await maxAffordable(pool, wallet, offer.effectivePricePerEnergy ?? offer.pricePerEnergy);
+    if (affordable !== null) {
+      quantity = Math.min(quantity, affordable);
+      if (quantity < cycle.min_bid) {
+        if (!noBudgetUntil.has(cycle.cycle_id)) {
+          console.warn(`[buyer] Sin margen de crédito en ${cycle.cycle_id}: alcanza para ${affordable} kWh (minBid ${cycle.min_bid}); no se compra`);
+        }
+        noBudgetUntil.set(cycle.cycle_id, Date.now() + NO_BUDGET_RETRY_MS);
+        if (noBudgetUntil.size > 50) noBudgetUntil.delete(noBudgetUntil.keys().next().value);
+        return false;
+      }
+    }
     const bid = await reserveBid(pool, { cycleId: cycle.cycle_id, offer,
-      quantity: cycle.deficit_kwh, minBid: cycle.min_bid });
+      quantity, minBid: cycle.min_bid });
     if (!bid) return false;
     await publishBid(pool, bid.idpk, publishOptions);
     return true;
@@ -123,4 +144,4 @@ function startWorker(pool, { wallet, walletBaseUrl, onTick = () => {}, intervalM
   return { health, wake: tick, stop() { stopped = true; clearInterval(timer); } };
 }
 
-module.exports = { runOnce, startWorker };
+module.exports = { runOnce, startWorker, _resetBudgetCache: () => noBudgetUntil.clear() };

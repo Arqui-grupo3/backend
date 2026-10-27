@@ -17,8 +17,6 @@ Continúa el registro [Entrega 2](2026-10-21-24-p1-e2.md). Se omitieron los mens
 > ☐ P3: ciclo base contra la central real: status-statement, eventos de la wallet, imbalance-settlement y negotiation-report en todos los ciclos
 > quiero que me expliques paso a paso como hacer esto y me explique el como funciona
 
-> quiero hacer el paso que te dije antes
-
 > [pega la salida de `docker compose ps` y de los logs de `master` en la EC2] hasta que hora tendria que esperar?
 
 > [adjunta una captura del roadmap con las tareas pendientes] esto le falta a mi grupo, es por cosas que le falta?
@@ -45,31 +43,12 @@ Corrió él mismo cada comando en la EC2, sin dar al asistente acceso al servido
 
 ---
 
-## 2. Incidente de deploy por `seller/`
-
-### Prompts relevantes
-
-> [adjunta una captura del job "Desplegar en la EC2" fallido: la API responde 502 en los 20 intentos] esto con los datos anteriores
-
-### Trabajo asistido
-
-- Diagnóstico desde `main` en GitHub: el PR #24 agregó `require('./seller')` en `master/index.js`, pero el `master/Dockerfile` no copiaba `seller/`. `master` se caía al partir y el API Gateway respondía 502. Es el mismo patrón del incidente de `./wallet` (PR #22).
-- Arreglo de una línea (`COPY seller/ ./seller/`), con una prueba local de la imagen antes de subirla.
-
-### Decisiones del usuario
-
-Aplicó el arreglo, abrió el PR #27 hacia `main` y llevó el cambio a `develop` con el PR #28.
-
----
-
-## 3. Configuración en caliente mínima
+## 2. Configuración en caliente mínima
 
 ### Prompts relevantes
 
 > configuración en caliente mínima (endpoint, sin interfaz): precio, cantidad, span y flag para apagar el mercado
 > quiero que me ayudes y me expliques paso a paso como hacer esto
-
-> no quiero que hagas un .patch, quiero que cambies directamente los archivos
 
 ### Trabajo asistido
 
@@ -94,5 +73,4 @@ El asistente entregó primero un parche. El usuario pidió en cambio que se modi
 ## Resultado y límites
 
 - El ciclo base funciona contra la central desde el deploy del PR #28: tres ciclos seguidos con el reporte `acknowledged` al momento de este registro. Faltaba completar unas 2 horas de ciclos para tachar la tarea.
-- El saldo local no cuadra con lo esperado en kWh. Queda pendiente compararlo con la wallet. Además, `master` busca `WALLET_BASE_URL` y `WALLET_API_KEY`, y no se encontraron en el `.env` de la EC2. Si faltan, el vendedor no publica ofertas.
 - La configuración en caliente queda en la carpeta del usuario, pendiente de PR. Faltan las rutas en el API Gateway, si están definidas una por una. El span todavía no lo usa nadie, porque el comprador (P2) no existe.

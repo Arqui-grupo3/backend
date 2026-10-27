@@ -4,7 +4,8 @@ const { randomUUID, generateKeyPairSync, sign } = require('node:crypto');
 const { Pool } = require('pg');
 const { migrate, recordEvent } = require('../ledger');
 const { recordMarketMessage } = require('../market');
-const { runOnce, startWorker } = require('../buyer/worker');
+const { runOnce, startWorker, _resetBudgetCache } = require('../buyer/worker');
+const { affordableQuantity } = require('../buyer/budget');
 const { getConfig, setConfig } = require('../buyer/config');
 const { createTokenVerifier, InvalidSwapToken } = require('../buyer/token');
 const { createWalletClient } = require('../wallet');
@@ -53,8 +54,8 @@ async function fixture(t, { opensAt = Date.now() - 421000, cycleId = 'cycle-1' }
   }, { cycleId });
   await recordEvent(pool, status);
   await recordEvent(pool, envelope('distance-table', { disabledRouteTransportCost: 100,
-    distances: { HGW: { enabled: true, distance: 2, transportCost: 1 },
-      MET: { enabled: true, distance: 20, transportCost: 1 } } }, { cycleId }));
+    distances: { HGW: { enabled: true, distance: 2000, transportCost: 1 },
+      MET: { enabled: true, distance: 20000, transportCost: 1 } } }, { cycleId }));
   for (const [cityId, price] of [['HGW', 10], ['MET', 5]]) {
     await recordMarketMessage(pool, envelope('offer', { offerId: `${cityId}-1`, quantity: 100,
       pricePerEnergy: price }, { sender: undefined, cityId, cycleId }));
@@ -166,7 +167,7 @@ test('buyer worker: revalida transporte al aceptar y rechaza un token adulterado
   await f.tick();
   await recordEvent(f.pool, accepted(f.published[0].msgId, { swapToken: token(claimsFor({ memo: 'otra-oferta' })) }));
   await recordEvent(f.pool, envelope('distance-table', { disabledRouteTransportCost: 100,
-    distances: { HGW: { enabled: true, distance: 2, transportCost: 100 } } }));
+    distances: { HGW: { enabled: true, distance: 2000, transportCost: 100 } } }));
   await recordEvent(f.pool, accepted(f.published[0].msgId));
   await f.tick();
   assert.equal((await bidState(f.pool)).status, 'sent');
@@ -294,4 +295,48 @@ test('buyer worker: arranca, refleja salud y puede detenerse', async t => {
   worker.stop();
   await worker.wake();
   assert.equal(f.published.length, 1);
+});
+
+// Línea de crédito (enunciado, "1 · La wallet"): se compra con saldo negativo hasta -creditLine.
+// En la fixture el déficit es 26 kWh y la mejor oferta es HGW a 10 + 2 de transporte = 12.
+const balance = (available, creditLine) => ({ cityId: 'REE', assets: {
+  CR: { available, held: 0, creditLine }, KWH: { available: 0, held: 0 } } });
+const balanceReads = f => f.walletCalls.filter(c => c.url.endsWith('/balance')).length;
+
+test('buyer budget: affordableQuantity usa available + creditLine - comprometido', () => {
+  assert.equal(affordableQuantity({ available: -1000, creditLine: 1200, unitPrice: 12 }), 16);
+  assert.equal(affordableQuantity({ available: -1000, creditLine: 1200, committed: 120, unitPrice: 12 }), 6);
+  assert.equal(affordableQuantity({ available: 500, creditLine: 0, unitPrice: '12.50' }), 40);
+  assert.equal(affordableQuantity({ available: -17450985.41, creditLine: 1388674.8, unitPrice: 56.11 }), 0, 'el caso real de REE');
+  assert.equal(affordableQuantity({ available: 100, creditLine: 0, unitPrice: 0 }), 0);
+});
+
+test('buyer budget: con margen parcial compra solo lo que alcanza a pagar', async t => {
+  _resetBudgetCache();
+  const f = await fixture(t);
+  f.snapshot(balance(-1000, 1200));
+  assert.equal(await f.tick(), true);
+  assert.equal(f.published[0].data.offerId, 'HGW-1');
+  assert.equal(f.published[0].data.quantity, 16, '200 CR de margen / 12 por kWh, no los 26 del déficit');
+  assert.equal((await bidState(f.pool)).quantity, 16);
+});
+
+test('buyer budget: sin margen para minBid no reserva ni publica, y no relee /balance por 30 s', async t => {
+  _resetBudgetCache();
+  const f = await fixture(t);
+  f.snapshot(balance(-1150, 1200));
+  assert.equal(await f.tick(), false, '50 CR alcanzan para 4 kWh, bajo minBid 10');
+  assert.equal(f.published.length, 0);
+  assert.equal((await f.pool.query('SELECT count(*)::int AS n FROM buyer_bids')).rows[0].n, 0);
+  const reads = balanceReads(f);
+  assert.equal(await f.tick(), false);
+  assert.equal(balanceReads(f), reads, 'no vuelve a consultar el saldo en el mismo ciclo antes de 30 s');
+});
+
+test('buyer budget: si /balance no trae CR (o falla), no limita y la wallet decide', async t => {
+  _resetBudgetCache();
+  const f = await fixture(t);
+  // La fixture responde a cualquier GET con el snapshot del swap: no hay assets.CR.
+  assert.equal(await f.tick(), true);
+  assert.equal(f.published[0].data.quantity, 26);
 });
