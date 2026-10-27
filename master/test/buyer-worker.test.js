@@ -153,7 +153,7 @@ test('buyer worker: un rechazo libera déficit y elige otra oferta disponible', 
   await f.tick();
   await recordMarketMessage(f.pool, envelope('offer-updated', { offerId: 'MET-1', remaining: 100, pricePerEnergy: 0 }, { cityId: 'MET' }));
   await recordEvent(f.pool, envelope('bid-rejected', { target: f.published[0].msgId,
-    offerId: 'HGW-1', requested: 26 }, { sender: undefined, cityId: 'HGW', reason: 'QUANTITY_UNAVAILABLE', code: 409 }));
+    offerId: 'HGW-1', requested: 26, available: 0 }, { sender: undefined, cityId: 'HGW', reason: 'QUANTITY_UNAVAILABLE', code: 409 }));
   await f.pool.query("UPDATE buyer_bid_attempts SET started_at=clock_timestamp()-interval '31 seconds'");
   await f.tick();
   assert.equal((await bidState(f.pool)).status, 'rejected');
@@ -339,4 +339,157 @@ test('buyer budget: si /balance no trae CR (o falla), no limita y la wallet deci
   // La fixture responde a cualquier GET con el snapshot del swap: no hay assets.CR.
   assert.equal(await f.tick(), true);
   assert.equal(f.published[0].data.quantity, 26);
+});
+
+function rejectionFor(
+  bid,
+  available,
+  { reason = 'QUANTITY_UNAVAILABLE', code = 409 } = {}
+) {
+  return envelope('bid-rejected', {
+    target: bid.msgId,
+    offerId: bid.data.offerId,
+    requested: bid.data.quantity,
+    available,
+  }, {
+    sender: undefined,
+    cityId: bid.routingKey.slice('city.'.length),
+    reason,
+    code,
+  });
+}
+
+// Supera el límite de un envío cada 2 s, sin alcanzar
+// los 30 s que disparan un reenvío del mismo bid.
+const allowNextBid = pool => pool.query(
+  `UPDATE buyer_bid_attempts
+   SET started_at=clock_timestamp()-interval '3 seconds'`
+);
+
+test('buyer: usa available y crea pedidos menores sin duplicarlos', async t => {
+  const f = await fixture(t);
+  await f.tick();
+
+  assert.equal(f.published[0].data.quantity, 26);
+
+  for (const available of [20, 10]) {
+    const previous = f.published.at(-1);
+
+    await recordEvent(f.pool, rejectionFor(previous, available));
+    await allowNextBid(f.pool);
+
+    const before = f.published.length;
+
+    // Dos workers no deben crear dos pedidos nuevos.
+    await Promise.all([f.tick(), f.tick()]);
+
+    assert.equal(f.published.length, before + 1);
+
+    const next = f.published.at(-1);
+    assert.notEqual(next.idpk, previous.idpk);
+    assert.notEqual(next.msgId, previous.msgId);
+    assert.deepEqual(next.data, {
+      offerId: previous.data.offerId,
+      quantity: available,
+    });
+
+    // Una respuesta tardía del pedido anterior no debe
+    // volver a abrir la oferta ni duplicar el pedido actual.
+    await recordEvent(f.pool, rejectionFor(previous, available));
+    await allowNextBid(f.pool);
+
+    assert.equal(await f.tick(), false);
+    assert.equal(f.published.length, before + 1);
+  }
+
+  assert.deepEqual(
+    f.published.map(bid => bid.data.quantity),
+    [26, 20, 10]
+  );
+
+  const { rows } = await f.pool.query(
+    `SELECT SUM(quantity)::int AS committed
+     FROM buyer_bids
+     WHERE status IN ('reserved', 'sent', 'accepted', 'settled')`
+  );
+
+  assert.equal(rows[0].committed, 10);
+});
+
+for (const scenario of [
+  { name: 'sin stock', available: 0 },
+  { name: 'bajo minBid', available: 9 },
+  { name: 'cantidad fraccionaria', available: 10.5 },
+  { name: 'sin available', available: undefined },
+  { name: 'cantidad igual a la rechazada', available: 26 },
+  { name: 'cantidad mayor a la rechazada', available: 30 },
+  {
+    name: 'oferta retirada',
+    available: 20,
+    reason: 'OFFER_WITHDRAWN',
+    code: 410,
+  },
+  {
+    name: 'pedido bajo el mínimo',
+    available: 20,
+    reason: 'BID_TOO_SMALL',
+    code: 422,
+  },
+  {
+    name: 'mercado cerrado',
+    available: 20,
+    reason: 'MARKET_CLOSED',
+    code: 410,
+  },
+  {
+    name: 'compra propia',
+    available: 20,
+    reason: 'SELF_TRADE',
+    code: 422,
+  },
+]) {
+  test(`buyer: no crea otro pedido ante ${scenario.name}`, async t => {
+    const f = await fixture(t);
+    await f.tick();
+
+    await recordEvent(
+      f.pool,
+      rejectionFor(f.published[0], scenario.available, scenario)
+    );
+    await allowNextBid(f.pool);
+
+    assert.equal(await f.tick(), false);
+    assert.equal(f.published.length, 1);
+  });
+}
+
+test('buyer: limita el segundo pedido por el crédito disponible', async t => {
+  _resetBudgetCache();
+  const f = await fixture(t);
+  await f.tick();
+
+  await recordEvent(f.pool, rejectionFor(f.published[0], 20));
+
+  // Quedan 200 CR de margen. A 12 CR efectivos por kWh,
+  // alcanza para 16, aunque el vendedor informe 20.
+  f.snapshot(balance(-1000, 1200));
+  await allowNextBid(f.pool);
+
+  assert.equal(await f.tick(), true);
+  assert.equal(f.published[1].data.quantity, 16);
+});
+
+test('buyer: no crea el segundo pedido después de lastBidAt', async t => {
+  const f = await fixture(t);
+  await f.tick();
+
+  await recordEvent(f.pool, rejectionFor(f.published[0], 20));
+  await allowNextBid(f.pool);
+  await f.pool.query(
+    `UPDATE buyer_cycles
+     SET last_bid_at=clock_timestamp()-interval '1 second'`
+  );
+
+  assert.equal(await f.tick(), false);
+  assert.equal(f.published.length, 1);
 });

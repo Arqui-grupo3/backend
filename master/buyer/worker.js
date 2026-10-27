@@ -86,11 +86,70 @@ async function runOnce(pool, { wallet, verifyToken, cityId = process.env.CITY_ID
       ORDER BY c.buy_at DESC LIMIT 1`);
     const cycle = cycles.rows[0];
     if (!cycle) return false;
-    const attempted = new Set((await pool.query(
-      'SELECT offer_id FROM buyer_bids WHERE cycle_id=$1', [cycle.cycle_id])).rows.map(b => b.offer_id));
-    const offers = await getEffectiveOffers(pool, cycle.cycle_id,
-      { cityId, imbalancePrice: cycle.imbalance_price });
-    const offer = offers.find(o => !attempted.has(o.offerId) && (o.remaining ?? o.quantity) >= cycle.min_bid);
+    const { rows: history } = await pool.query(
+      `SELECT offer_id, status, quantity, last_result
+       FROM buyer_bids
+       WHERE cycle_id=$1
+       ORDER BY created_at DESC, idpk DESC`,
+      [cycle.cycle_id]
+    );
+
+    const latestByOffer = new Map();
+    const pendingOffers = new Set();
+
+    for (const bid of history) {
+      // El primer registro de cada oferta es su bid más reciente.
+      if (!latestByOffer.has(bid.offer_id)) {
+        latestByOffer.set(bid.offer_id, bid);
+      }
+
+      // Mientras exista un compromiso pendiente, no creamos otro.
+      if (['reserved', 'sent', 'accepted'].includes(bid.status)) {
+        pendingOffers.add(bid.offer_id);
+      }
+    }
+
+    const offers = await getEffectiveOffers(pool, cycle.cycle_id, {
+      cityId,
+      imbalancePrice: cycle.imbalance_price,
+    });
+
+    let offer;
+
+    for (const candidate of offers) {
+      if (pendingOffers.has(candidate.offerId)) continue;
+
+      let remaining = candidate.remaining ?? candidate.quantity;
+      const previous = latestByOffer.get(candidate.offerId);
+
+      if (previous) {
+        const rejection = previous.last_result;
+        const available = rejection?.data?.available;
+
+        // Solo reconsideramos una oferta por un rechazo explícito
+        // que permita reducir la cantidad del siguiente pedido.
+        if (
+          previous.status !== 'rejected' ||
+          rejection?.type !== 'bid-rejected' ||
+          rejection.reason !== 'QUANTITY_UNAVAILABLE' ||
+          !Number.isSafeInteger(available) ||
+          available < cycle.min_bid ||
+          available >= previous.quantity
+        ) {
+          continue;
+        }
+
+        remaining = Math.min(remaining, available);
+      }
+
+      if (!Number.isSafeInteger(remaining) || remaining < cycle.min_bid) {
+        continue;
+      }
+
+      offer = { ...candidate, remaining };
+      break;
+    }
+
     if (!offer) return false;
     // Limita la compra a lo que alcanza a pagar dentro de la línea de crédito.
     let quantity = cycle.deficit_kwh;
