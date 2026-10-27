@@ -87,8 +87,8 @@ test('precio efectivo usa ofertas del ciclo y la última tabla de rutas guardada
   await recordMarketMessage(pool, { ...offer('COR', 'COR-old', 100, 1, 1), cycleId: 'cycle-old' });
 
   const distances = {
-    HGW: { distance: 100, transportCost: 0.1, enabled: true },
-    MET: { distance: 100, transportCost: 0.2, enabled: true },
+    HGW: { distance: 100000, transportCost: 0.1, enabled: true },
+    MET: { distance: 100000, transportCost: 0.2, enabled: true },
   };
   const saveTable = (data, receivedAt) => pool.query(
     `INSERT INTO events(id,idpk,msg_id,type,cycle_id,package_body,received_at)
@@ -97,7 +97,7 @@ test('precio efectivo usa ofertas del ciclo y la última tabla de rutas guardada
   );
   await saveTable({
     disabledRouteTransportCost: 6,
-    distances: { ...distances, COR: { distance: 1, transportCost: 0, enabled: true } },
+    distances: { ...distances, COR: { distance: 1000, transportCost: 0, enabled: true } },
   }, at(10));
 
   const options = { imbalancePrice: '1000.00' };
