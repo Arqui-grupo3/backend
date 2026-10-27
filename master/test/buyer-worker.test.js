@@ -7,6 +7,7 @@ const { recordMarketMessage } = require('../market');
 const { runOnce, startWorker, _resetBudgetCache } = require('../buyer/worker');
 const { affordableQuantity } = require('../buyer/budget');
 const { getConfig, setConfig } = require('../buyer/config');
+const strategy = require('../config');
 const { createTokenVerifier, InvalidSwapToken } = require('../buyer/token');
 const { createWalletClient } = require('../wallet');
 
@@ -103,9 +104,9 @@ test('buyer config: cambia el próximo ciclo, conserva snapshot actual y valida 
   const next = { ...f.status, idpk: randomUUID(), msgId: randomUUID(), cycleId: 'cycle-2' };
   await recordEvent(f.pool, next);
   const rows = (await f.pool.query('SELECT * FROM buyer_cycles ORDER BY cycle_id')).rows;
-  assert.equal(rows[0].strategy_version, before.strategy_version);
+  assert.equal(rows[0].config_version, before.config_version);
   assert.equal(+rows[0].buy_at, +before.buy_at);
-  assert.equal(rows[1].strategy_version, config.version);
+  assert.equal(rows[1].config_version, config.version);
   assert.equal(+rows[1].buy_at, Date.parse(next.data.market.opensAt) + 360000);
   for (const value of [-1, 540, 1.5, '360']) {
     await assert.rejects(setConfig(f.pool, { spanSeconds: value }), { statusCode: 422 });
@@ -339,4 +340,47 @@ test('buyer budget: si /balance no trae CR (o falla), no limita y la wallet deci
   // La fixture responde a cualquier GET con el snapshot del swap: no hay assets.CR.
   assert.equal(await f.tick(), true);
   assert.equal(f.published[0].data.quantity, 26);
+});
+
+// Una sola configuración (ADR 0006): /config y /buyer/config son la misma strategy_config.
+test('config única: la migración 014 traspasa el span del comprador (420 s) a strategy_config', async t => {
+  const f = await fixture(t);
+  const current = await strategy.getCurrent(f.pool);
+  assert.equal(current.spanSeconds, 420, 'se conserva el span que usaba el comprador');
+  assert.equal(current.updatedBy, 'migracion-014');
+  const cycle = (await f.pool.query('SELECT config_version FROM buyer_cycles')).rows[0];
+  const frozen = (await f.pool.query("SELECT config_version FROM cycle_config WHERE cycle_id = 'cycle-1'")).rows[0];
+  assert.equal(cycle.config_version, frozen.config_version, 'comprador y vendedor usan la misma versión del ciclo');
+});
+
+test('config única: cambiar spanSeconds en /config cambia la hora de compra del ciclo siguiente', async t => {
+  const f = await fixture(t);
+  const { current } = await strategy.updateConfig(f.pool, { spanSeconds: 300 });
+  const next = { ...f.status, idpk: randomUUID(), msgId: randomUUID(), cycleId: 'cycle-2' };
+  await recordEvent(f.pool, next);
+  const row = (await f.pool.query("SELECT config_version, buy_at FROM buyer_cycles WHERE cycle_id = 'cycle-2'")).rows[0];
+  assert.equal(row.config_version, current.version);
+  assert.equal(+row.buy_at, Date.parse(next.data.market.opensAt) + 300000);
+});
+
+test('config única: apagar el mercado en /config detiene al comprador', async t => {
+  const f = await fixture(t);
+  await strategy.updateConfig(f.pool, { marketEnabled: false });
+  assert.equal(await f.tick(), false);
+  assert.equal(f.published.length, 0);
+  assert.equal((await getConfig(f.pool)).enabled, false, '/buyer/config ve el mismo interruptor');
+  await strategy.updateConfig(f.pool, { marketEnabled: true });
+  assert.equal(await f.tick(), true);
+});
+
+test('config única: /buyer/config escribe en strategy_config y conserva el resto', async t => {
+  const f = await fixture(t);
+  await strategy.updateConfig(f.pool, { priceFactor: 0.6 });
+  const res = await setConfig(f.pool, { spanSeconds: 360, enabled: false });
+  assert.equal(res.previous.enabled, true);
+  const current = await strategy.getCurrent(f.pool);
+  assert.equal(current.spanSeconds, 360);
+  assert.equal(current.marketEnabled, false);
+  assert.equal(current.priceFactor, 0.6, 'no pisa el precio del vendedor');
+  assert.equal(current.note, 'vía /buyer/config');
 });
