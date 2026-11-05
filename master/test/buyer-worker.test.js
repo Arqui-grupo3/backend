@@ -81,6 +81,12 @@ async function fixture(t, { opensAt = Date.now() - 421000, cycleId = 'cycle-1', 
   return { pool, status, wallet, published, walletCalls, options,
     snapshot(value) { snapshot = value; }, tick: () => runOnce(pool, options) };
 }
+// El worker envía como máximo un bid cada 2 s: las pruebas que encadenan bids corren el
+// último intento hacia atrás en vez de esperar.
+const allowNextBid = pool => pool.query(
+  `UPDATE buyer_bid_attempts
+   SET started_at=clock_timestamp()-interval '3 seconds'`
+);
 const bidState = async pool => (await pool.query('SELECT * FROM buyer_bids ORDER BY created_at LIMIT 1')).rows[0];
 
 test('buyer worker: espera el span y al reiniciar compra por precio efectivo sin duplicar reservas', async t => {
