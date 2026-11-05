@@ -146,7 +146,6 @@ async function initDb() {
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_received_at ON api_audit (received_at DESC);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_reason ON api_audit (reason);');
 
-      // Tabla unificada de auditoría y rechazados (persistanceDev)
       await pool.query(`
         CREATE TABLE IF NOT EXISTS rejected_messages (
           id UUID PRIMARY KEY,
@@ -285,7 +284,6 @@ app.post('/events', async (req, res) => {
 
   if (type === 'bid') {
     try {
-      // requireWallet: sin cliente de la wallet no se acepta ningún bid (la reserva no se liberaría).
       const decision = await seller.processIncomingBid(pool, { ...body, receivedAt: receivedAtValue }, { walletClient: wallet, requireWallet: true });
       return res.status(200).json({ idpk, type: 'bid', decision });
     } catch (err) {
@@ -314,9 +312,7 @@ app.post('/events', async (req, res) => {
       const capacity = energy.generationCapacity || 0;
       const consumption = energy.consumption || 0;
       const generationCost = energy.generationCost || 0;
-      // v3: la central informa los kWh vendibles acreditados en la wallet.
       const sellable = Number.isInteger(energy.sellable) ? energy.sellable : Math.floor(Math.max(0, capacity - consumption));
-      // ADR 0006: se congela la configuración del ciclo. Si falla, no se vende este ciclo.
       let cycleConfig = null;
       try {
         cycleConfig = await strategyConfig.freezeForCycle(pool, body.cycleId);
@@ -327,7 +323,6 @@ app.post('/events', async (req, res) => {
         console.warn(`[config] Mercado apagado: no se publica oferta en ${body.cycleId}`);
       }
       if (sellable > 0 && cycleConfig?.marketEnabled) {
-        // imbalancePrice viene en data.market y es 3 × el costo MÁS ALTO de todas las ciudades.
         let imbalancePrice = market.imbalancePrice;
         if (!Number.isFinite(imbalancePrice)) {
           console.warn(`[seller] status-statement sin market.imbalancePrice en ${body.cycleId}; se usa 3 × costo propio`);
@@ -354,29 +349,19 @@ app.post('/events', async (req, res) => {
     if (type === 'swap-proposed') {
       await seller.handleSwapProposed(pool, body, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-proposed handler error:', e.message));
     } else if (type === 'swap-settled') {
-      // Al vendedor, swap-settled trae en data.idpk la llave del accept del comprador,
-      // no la nuestra: el bid se encuentra por swapId (guardado al llegar swap-proposed).
       const swapId = body.data?.swapId;
       await seller.handleSwapSettled(pool, { swapId }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
     } else if (type === 'swap-expired' || type === 'swap-cancelled') {
-      // data.idpk es la Idempotency-Key de la operación que causó el evento (no el idpk
-      // del mensaje). Si no tiene formato UUID (p. ej. la de la central), se ignora.
       const swapId = body.data?.swapId;
       const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
       await seller.releaseSwap(pool, { swapId, swapIdpk, reason: type }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
     } else if (type === 'swap-rejected' && body.data?.operation === 'accept') {
-      // La wallet rechazó el accept del comprador (p. ej. INSUFFICIENT_ASSET: no le
-      // alcanzó el CR). Verificado en producción con GET /swaps/{id}: el swap queda
-      // 'rejected' (terminal) y la wallet ya liberó los kWh retenidos. Si no se libera
-      // aquí, la reserva local queda colgada y el remanente de la oferta se achica con
-      // cada reintento del comprador. data.idpk es la llave del comprador: se usa swapId.
       const swapId = body.data?.swapId;
       if (swapId) {
         console.warn(`[seller] El comprador no pudo aceptar ${swapId}: ${body.reason || body.data?.message || 'swap-rejected'}`);
         await seller.releaseSwap(pool, { swapId, reason: 'ACCEPT_REJECTED' }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected (accept) handler error:', e.message));
       }
     } else if (type === 'swap-rejected' && body.data?.operation === 'propose') {
-      // Rechazo de NUESTRA propuesta: el swap no llegó a existir. Puede no traer swapId.
       const swapId = body.data?.swapId;
       const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
       await seller.handleProposalRejected(pool, { swapId, swapIdpk }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected handler error:', e.message));
@@ -390,7 +375,6 @@ app.post('/events', async (req, res) => {
   }
 });
 
-// Configuración en caliente (ADR 0006). Sin interfaz: se usa con curl o Postman.
 app.get('/config', authenticate, async (req, res) => {
   try {
     res.json(await strategyConfig.getCurrent(pool));
@@ -425,7 +409,6 @@ app.put('/config', authenticate, async (req, res) => {
   try {
     const result = await strategyConfig.updateConfig(pool, req.body, { updatedBy: req.auth?.sub || null });
     let withdrawn = [];
-    // Interruptor de emergencia: al apagar, se retiran altiro las ofertas activas.
     if (result.previous.marketEnabled && !result.current.marketEnabled) {
       withdrawn = await seller.withdrawActiveOffers(pool, { connectorUrl: CONNECTOR_URL });
     }
@@ -520,7 +503,6 @@ app.patch('/audit/:id/response', async (req, res) => {
   }
 });
 
-// GET Audit ahora expone el flujo enriquecido de persistanceDev
 app.get('/audit', authenticate, async (req, res) => {
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
@@ -734,18 +716,12 @@ app.get('/history/:id', authenticate, async (req, res) => {
 
 app.get('/distance-table', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, idpk, type, package_body AS "data", received_at AS "receivedAt"
-       FROM events
-       WHERE type = 'distance-table'
-         AND jsonb_typeof(package_body->'distances') = 'object'
-       ORDER BY seq DESC
-       LIMIT 1`
-    );
-    if (result.rowCount === 0) {
+    const table = await market.getLatestDistanceTable(pool);
+    if (!table) {
       return res.status(404).json({ error: 'No hay una distance-table vigente registrada' });
     }
-    res.json(result.rows[0]);
+    const { id, idpk, type, data, receivedAt } = table;
+    res.json({ id, idpk, type, data, receivedAt });
   } catch (err) {
     console.error('[master] Error al consultar /distance-table:', err.message);
     res.status(500).json({ error: 'Error interno al consultar la distance-table vigente' });
@@ -754,14 +730,13 @@ app.get('/distance-table', authenticate, async (req, res) => {
 
 app.get('/connectivity', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, cycle_id AS "cycleId", package_body AS data, received_at AS "receivedAt"
-       FROM events
-       WHERE type = 'distance-table'
-       ORDER BY seq DESC
-       LIMIT 1`
-    );
-    res.json(result.rows[0] || null);
+    const table = await market.getLatestDistanceTable(pool);
+    res.json(table ? {
+      id: table.id,
+      cycleId: table.cycleId,
+      data: table.data,
+      receivedAt: table.receivedAt,
+    } : null);
   } catch (err) {
     console.error('[master] Error al consultar /connectivity:', err.message);
     res.status(500).json({ error: 'Error interno al consultar conectividad' });
@@ -810,8 +785,6 @@ initDb().then(() => {
      console.warn('[master] Falta WALLET_BASE_URL o WALLET_API_KEY: cliente de la wallet deshabilitado');
    }
 
-  // Bajada de precio de nuestra oferta durante el ciclo (ADR 0006). Cada 5 s revisa si
-  // toca un escalón nuevo; el escalón real es de 1 minuto (seller.decayOfferPrices).
   setInterval(() => {
     seller.decayOfferPrices(pool, { connectorUrl: CONNECTOR_URL })
       .then((changed) => changed.forEach((c) => console.log(`[seller] Precio de ${c.offerId} baja a ${c.pricePerEnergy}`)))

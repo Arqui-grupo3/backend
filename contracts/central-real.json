@@ -1,0 +1,122 @@
+{
+  "_nota": "Mensajes reales de la central (protocolo v3) sacados de producción. 'data' es exactamente lo que llegó; cuando el sobre no se guardó completo, idpk/msgId/timestamp se reconstruyen. Se regenera con el comando de contracts/README.md.",
+  "distance-table": {
+    "cola": "city",
+    "_fuente": "events, ciclo del lunes 26 (data real, recortada a 7 rutas completas)",
+    "mensaje": {
+      "idpk": "6f0d6c1e-8a51-4c39-9c0e-2f0b8d1a7a01",
+      "msgId": "0c9a2e47-7b1d-4f50-a3b2-5d8f1e6c9b02",
+      "type": "distance-table",
+      "sender": "central",
+      "cycleId": "cycle-249222",
+      "timestamp": "2026-10-26T19:05:00.000Z",
+      "data": {
+        "distances": {
+          "COR": {
+            "enabled": true,
+            "distance": 20561284,
+            "transportCost": 0.009
+          },
+          "HGW": {
+            "enabled": true,
+            "distance": 54516593,
+            "transportCost": 0.0048
+          },
+          "KLD": {
+            "enabled": true,
+            "distance": 42193361,
+            "transportCost": 0.0175
+          },
+          "LSN": {
+            "enabled": true,
+            "distance": 67125681,
+            "transportCost": 0.0001
+          },
+          "MET": {
+            "enabled": true,
+            "distance": 65880302,
+            "transportCost": 0.0001
+          },
+          "MTI": {
+            "enabled": true,
+            "distance": 52689018,
+            "transportCost": 0.0001
+          },
+          "NNY": {
+            "enabled": true,
+            "distance": 49576459,
+            "transportCost": 0.0044
+          }
+        }
+      }
+    }
+  },
+  "trade-recorded": {
+    "cola": "city",
+    "_fuente": "events, venta REE→MET del ciclo 249226 (data real)",
+    "mensaje": {
+      "idpk": "a2f4b6c8-1d3e-4f50-8a7b-9c0d1e2f3a03",
+      "msgId": "b3e5c7d9-2e4f-4a61-9b8c-0d1e2f3a4b04",
+      "type": "trade-recorded",
+      "sender": "central",
+      "cycleId": "cycle-249226",
+      "timestamp": "2026-10-26T20:13:10.000Z",
+      "data": {
+        "buyer": "MET",
+        "seller": "REE",
+        "swapId": "c56b78e1-7a0e-4419-ba62-32247ea26314",
+        "offerId": "REE-cycle-249226-offer",
+        "quantity": 10690,
+        "energyTotal": 1568757.5,
+        "routeEnabled": true,
+        "pricePerEnergy": 146.75,
+        "transportTotal": 70447.1,
+        "transportPerEnergy": 6.59
+      }
+    }
+  },
+  "imbalance-settlement": {
+    "cola": "city",
+    "_fuente": "events, ciclo 249097 con déficit (data real)",
+    "mensaje": {
+      "idpk": "c4f6d8e0-3f5a-4b72-8c9d-1e2f3a4b5c05",
+      "msgId": "d5a7e9f1-4a6b-4c83-9d0e-2f3a4b5c6d06",
+      "type": "imbalance-settlement",
+      "sender": "central",
+      "cycleId": "cycle-249097",
+      "timestamp": "2026-10-25T01:35:00.000Z",
+      "data": {
+        "total": -5671685.25,
+        "deficit": 18953,
+        "kwhHeld": 0,
+        "coverage": -18953,
+        "balanceAfter": -43892094.51,
+        "settlementId": "403a36e6-a006-5379-a788-d790ff7b6ced",
+        "pricePerEnergy": 299.25
+      }
+    }
+  },
+  "swap-rejected": {
+    "cola": "city",
+    "_fuente": "buyer_bids.last_result del ciclo 249230 (mensaje completo real)",
+    "mensaje": {
+      "code": 402,
+      "data": {
+        "idpk": "3ffdc294-a91c-4714-8d7d-0186c1db85d8",
+        "asset": "CR",
+        "swapId": "474246d0-c690-4cc8-8788-07f053bb3a52",
+        "message": "CR available -6830814.01, required 74777.78",
+        "required": 74777.78,
+        "available": -6830814.01,
+        "operation": "accept"
+      },
+      "idpk": "1774e8e0-e9e7-41f8-8322-9179466c3815",
+      "type": "swap-rejected",
+      "msgId": "4a912e6c-5182-46c3-8da4-2b0c06a56316",
+      "reason": "INSUFFICIENT_ASSET",
+      "sender": "central",
+      "delivery": "direct",
+      "timestamp": "2026-10-26T21:52:04.897Z"
+    }
+  }
+}

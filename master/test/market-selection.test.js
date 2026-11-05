@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { rankOffers } = require('../market/selection');
+const { rankOffers, calculateTransportPerEnergy } = require('../market/selection');
 
 const offer = (cityId, price, remaining = 100) => ({
   offerId: `${cityId}-1`,
@@ -102,4 +102,19 @@ test('con la distance-table real, el transporte MET→REE es 6.59 y la oferta de
   assert.deepEqual(result.map(o => [o.offerId, o.transportPerEnergy, o.effectivePricePerEnergy]), [
     ['MET-249222', '6.59', '56.11'],
   ], 'KLD queda en 10 + 738.38 > 288.72 y se descarta');
+});
+
+test('calcula transporte cero sin confundirlo con una ruta ausente', () => {
+  const routes = {
+    distances: {
+      HGW: { enabled: true, distance: 0, transportCost: 1 },
+      MET: { enabled: true, distance: 1000, transportCost: 0 },
+    },
+  };
+  assert.equal(calculateTransportPerEnergy(routes, 'HGW').toFixed(2), '0.00');
+  assert.equal(calculateTransportPerEnergy(routes, 'MET').toFixed(2), '0.00');
+  assert.equal(calculateTransportPerEnergy(routes, 'COR'), null);
+  assert.equal(calculateTransportPerEnergy({
+    distances: { HGW: { enabled: false, distance: 1000, transportCost: 1 } },
+  }, 'HGW'), null);
 });

@@ -1,9 +1,9 @@
 const { randomUUID } = require('node:crypto');
 const Decimal = require('decimal.js').clone({ precision: 40 });
 const { rankOffers } = require('../market/selection');
+const { getLatestDistanceTable } = require('../market');
 const { InvalidSwapToken } = require('./token');
 
-// Se ejecuta en la misma transacción del evento, sin HTTP.
 async function onEvent(db, event, { cityId = process.env.CITY_ID || 'REE' } = {}) {
   if (['bid-accepted', 'bid-rejected'].includes(event.type)) {
     await db.query(`INSERT INTO buyer_responses (idpk, envelope) VALUES ($1,$2)
@@ -58,7 +58,7 @@ async function processResponse(pool, response, { wallet, verifyToken, cityId = p
   try {
     deadline = await verifyToken(d.swapToken, bid, d);
   } catch (error) {
-    if (!(error instanceof InvalidSwapToken)) throw error; // Fallo de red: queda pendiente.
+    if (!(error instanceof InvalidSwapToken)) throw error;
     return finish('ignored', error.message);
   }
 
@@ -66,11 +66,9 @@ async function processResponse(pool, response, { wallet, verifyToken, cityId = p
   try {
     await db.query('BEGIN');
     await db.query('SELECT pg_advisory_xact_lock(2173, 1)');
-    // Relee rutas dentro de la decisión; verificar el JWT no mantiene locks.
-    const table = (await db.query(`SELECT package_body FROM events
-      WHERE type='distance-table' ORDER BY seq DESC LIMIT 1`)).rows[0]?.package_body;
+    const table = await getLatestDistanceTable(db);
     const ranked = rankOffers([{ offerId: bid.offer_id, cityId: bid.seller_city_id,
-      quantity: bid.quantity, pricePerEnergy: bid.price_per_energy }], table,
+      quantity: bid.quantity, pricePerEnergy: bid.price_per_energy }], table?.data,
       { cityId, imbalancePrice: bid.imbalance_price });
     if (!ranked.length) {
       await db.query(`UPDATE buyer_responses SET status='ignored', error=$2 WHERE idpk=$1`,
@@ -84,7 +82,6 @@ async function processResponse(pool, response, { wallet, verifyToken, cityId = p
       WHERE idpk=$1 AND status IN ('reserved','sent') AND clock_timestamp() < $4
       RETURNING idpk`, [bid.idpk, d.swapId, acceptIdpk, deadline]);
     if (saved.rowCount) {
-      // Se confirma junto al estado del bid. El worker de wallet envía después.
       await wallet.acceptSwap(d.swapId, { idpk: acceptIdpk, deadline, db });
     }
     await db.query(`UPDATE buyer_responses SET status='handled', error=NULL WHERE idpk=$1`, [response.idpk]);

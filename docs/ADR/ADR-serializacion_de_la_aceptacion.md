@@ -56,3 +56,28 @@ El orden en que se atienden los bids es la política de aceptación, configurabl
 - Un comprador que no acepta bloquea su cantidad hasta el `expiresAt` del swap; por eso el plazo es corto.
 - El lock es por oferta: no bloquea los eventos de la wallet ni nuestro rol de comprador.
 - Cada `swap-rejected` por `INSUFFICIENT_ASSET` sobre una propuesta nuestra se registra y se envía a New Relic, para verificar la medida.
+
+## Recuperación del comprador ante un remanente desactualizado
+
+El enunciado, en «El bid», establece que `QUANTITY_UNAVAILABLE` informa
+`available` para pedir el remanente en un segundo bid. Marcar una oferta como
+intentada durante todo el ciclo impide esa recuperación.
+
+El comprador consulta el último bid de cada oferta y los compromisos pendientes
+del ciclo. Tras un `bid-rejected` definitivo por `QUANTITY_UNAVAILABLE`, puede
+crear un bid nuevo con una cantidad entera no mayor que `available` y el
+remanente del libro. La cantidad debe alcanzar `minBid` y ser menor que la
+rechazada; esta última condición evita repetir pedidos equivalentes sin progreso.
+Se conservan los límites de presupuesto, déficit pendiente y ventana de mercado.
+Las ofertas se siguen considerando por precio efectivo.
+
+Mientras exista un bid `reserved`, `sent` o `accepted` contra una oferta, no se
+crea otro. Los reenvíos de una operación pendiente conservan su `idpk`; el
+pedido menor, creado después del rechazo conocido, recibe otro `idpk`. Los
+rechazos tardíos del pedido anterior no cambian el estado del nuevo.
+
+Se conserva el rechazo completo en `buyer_bids.last_result`, por lo que no se
+requieren migraciones. Las pruebas cubren cantidades decrecientes, duplicados,
+workers concurrentes, otros rechazos, cantidades inválidas y límites de crédito
+y tiempo. El presupuesto de transporte y la unificación de configuración quedan
+fuera de este cambio.

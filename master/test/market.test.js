@@ -17,6 +17,7 @@ async function fixture(t) {
   await pool.query(`CREATE TABLE events(id UUID PRIMARY KEY,idpk TEXT UNIQUE NOT NULL,msg_id UUID,type TEXT NOT NULL,
     cycle_id TEXT,package_body JSONB,received_at TIMESTAMPTZ NOT NULL,seq BIGSERIAL);`);
   await pool.query(readFileSync(join(__dirname, '../migrations/007-market-feed.sql'), 'utf8'));
+  await pool.query(readFileSync(join(__dirname, '../migrations/014-distance-publication.sql'), 'utf8'));
   return pool;
 }
 
@@ -90,10 +91,10 @@ test('precio efectivo usa ofertas del ciclo y la última tabla de rutas guardada
     HGW: { distance: 100000, transportCost: 0.1, enabled: true },
     MET: { distance: 100000, transportCost: 0.2, enabled: true },
   };
-  const saveTable = (data, receivedAt) => pool.query(
-    `INSERT INTO events(id,idpk,msg_id,type,cycle_id,package_body,received_at)
-     VALUES ($1,$2,$3,'distance-table','cycle-1',$4,$5)`,
-    [randomUUID(), randomUUID(), randomUUID(), JSON.stringify(data), receivedAt]
+  const saveTable = (data, publishedAt, receivedAt = publishedAt) => pool.query(
+    `INSERT INTO events(id,idpk,msg_id,type,cycle_id,package_body,published_at,received_at)
+     VALUES ($1,$2,$3,'distance-table','cycle-1',$4,$5,$6)`,
+    [randomUUID(), randomUUID(), randomUUID(), JSON.stringify(data), publishedAt, receivedAt]
   );
   await saveTable({
     disabledRouteTransportCost: 6,
@@ -106,11 +107,13 @@ test('precio efectivo usa ofertas del ciclo y la última tabla de rutas guardada
     ['HGW-1', '310.00'], ['MET-1', '350.00'],
   ]);
 
-  // La última versión insertada manda por seq, aunque received_at sea anterior.
+  // La publicación nueva manda aunque received_at sea anterior.
   await saveTable({
     disabledRouteTransportCost: 6,
     distances: { ...distances, HGW: { ...distances.HGW, enabled: false } },
-  }, at(5));
+  }, at(20), at(5));
+  // Una tabla vieja recibida después no revierte la publicación nueva.
+  await saveTable({ disabledRouteTransportCost: 6, distances }, at(15), at(30));
 
   const after = await getEffectiveOffers(pool, 'cycle-1', options);
   assert.deepEqual(after.map(o => [o.offerId, o.effectivePricePerEnergy]), [

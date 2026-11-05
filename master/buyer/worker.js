@@ -1,16 +1,13 @@
 const { reserveBid, publishBid } = require('./index');
-const { getEffectiveOffers } = require('../market');
+const { getEffectiveOffers, getLatestDistanceTable } = require('../market');
 const { createTokenVerifier } = require('./token');
 const { onEvent, processResponse } = require('./responses');
 const { maxAffordable } = require('./budget');
 
-// Cuando el saldo no alcanza ni para minBid, se avisa una vez por ciclo y no se vuelve a
-// consultar /balance hasta 30 s después (la wallet es lenta y el worker corre cada segundo).
 const noBudgetUntil = new Map();
 const NO_BUDGET_RETRY_MS = 30_000;
 
 async function reconcile(pool, wallet, cityId) {
-  // Un 202 o un timeout siguen comprometidos hasta conocer el resultado.
   const { rows } = await pool.query(`SELECT b.*, w.status AS wallet_status
     FROM buyer_bids b JOIN wallet_ops w ON w.idpk=b.accept_idpk
     WHERE b.status='accepted' AND
@@ -27,7 +24,6 @@ async function reconcile(pool, wallet, cityId) {
     try {
       await db.query('BEGIN');
       await db.query('SELECT pg_advisory_xact_lock(2173, 1)');
-      // También recupera efectos si se perdió el evento AMQP; sus claves deduplican.
       const recovered = { ...event, sender: 'central', cycleId: bid.cycle_id };
       await require('../effects').onEvent(db, recovered);
       await onEvent(db, recovered, { cityId });
@@ -62,12 +58,10 @@ async function runOnce(pool, { wallet, verifyToken, cityId = process.env.CITY_ID
     const enabled = (await pool.query('SELECT market_enabled AS enabled FROM strategy_config ORDER BY version DESC LIMIT 1')).rows[0]?.enabled ?? false;
     if (!enabled) return false; // Lo pendiente anterior se sigue resolviendo arriba.
 
-    // Como máximo un envío del comprador cada 2 s, incluso con muchos wake().
     const recent = await pool.query(`SELECT 1 FROM buyer_bid_attempts
       WHERE started_at > clock_timestamp()-interval '2 seconds' LIMIT 1`);
     if (recent.rowCount) return false;
 
-    // Envío inicial + tres reintentos, separados al menos 30 segundos.
     const pending = await pool.query(`SELECT b.idpk FROM buyer_bids b JOIN buyer_cycles c USING (cycle_id)
       LEFT JOIN buyer_bid_attempts a ON a.bid_idpk=b.idpk
       WHERE b.status IN ('reserved','sent') AND clock_timestamp()<LEAST(c.last_bid_at,c.closes_at)
@@ -86,16 +80,75 @@ async function runOnce(pool, { wallet, verifyToken, cityId = process.env.CITY_ID
       ORDER BY c.buy_at DESC LIMIT 1`);
     const cycle = cycles.rows[0];
     if (!cycle) return false;
-    const attempted = new Set((await pool.query(
-      'SELECT offer_id FROM buyer_bids WHERE cycle_id=$1', [cycle.cycle_id])).rows.map(b => b.offer_id));
-    const offers = await getEffectiveOffers(pool, cycle.cycle_id,
-      { cityId, imbalancePrice: cycle.imbalance_price });
-    const offer = offers.find(o => !attempted.has(o.offerId) && (o.remaining ?? o.quantity) >= cycle.min_bid);
+    const { rows: history } = await pool.query(
+      `SELECT offer_id, status, quantity, last_result
+       FROM buyer_bids
+       WHERE cycle_id=$1
+       ORDER BY created_at DESC, idpk DESC`,
+      [cycle.cycle_id]
+    );
+
+    const latestByOffer = new Map();
+    const pendingOffers = new Set();
+
+    for (const bid of history) {
+      if (!latestByOffer.has(bid.offer_id)) {
+        latestByOffer.set(bid.offer_id, bid);
+      }
+
+      if (['reserved', 'sent', 'accepted'].includes(bid.status)) {
+        pendingOffers.add(bid.offer_id);
+      }
+    }
+
+    const table = await getLatestDistanceTable(pool);
+    if (!table) return false;
+    const offers = await getEffectiveOffers(pool, cycle.cycle_id, {
+      cityId,
+      imbalancePrice: cycle.imbalance_price,
+      distanceTable: table.data,
+    });
+
+    let offer;
+
+    for (const candidate of offers) {
+      if (pendingOffers.has(candidate.offerId)) continue;
+
+      let remaining = candidate.remaining ?? candidate.quantity;
+      const previous = latestByOffer.get(candidate.offerId);
+
+      if (previous) {
+        const rejection = previous.last_result;
+        const available = rejection?.data?.available;
+
+        if (
+          previous.status !== 'rejected' ||
+          rejection?.type !== 'bid-rejected' ||
+          rejection.reason !== 'QUANTITY_UNAVAILABLE' ||
+          !Number.isSafeInteger(available) ||
+          available < cycle.min_bid ||
+          available >= previous.quantity
+        ) {
+          continue;
+        }
+
+        remaining = Math.min(remaining, available);
+      }
+
+      if (!Number.isSafeInteger(remaining) || remaining < cycle.min_bid) {
+        continue;
+      }
+
+      offer = { ...candidate, remaining };
+      break;
+    }
+
     if (!offer) return false;
-    // Limita la compra a lo que alcanza a pagar dentro de la línea de crédito.
     let quantity = cycle.deficit_kwh;
     if ((noBudgetUntil.get(cycle.cycle_id) || 0) > Date.now()) return false;
-    const affordable = await maxAffordable(pool, wallet, offer.effectivePricePerEnergy ?? offer.pricePerEnergy);
+    const affordable = await maxAffordable(
+      pool, wallet, offer.effectivePricePerEnergy ?? offer.pricePerEnergy, table.data
+    );
     if (affordable !== null) {
       quantity = Math.min(quantity, affordable);
       if (quantity < cycle.min_bid) {
