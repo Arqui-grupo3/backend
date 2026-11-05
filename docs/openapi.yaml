@@ -266,6 +266,84 @@ paths:
           description: Razon invalida
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /experiment/span:
+    get:
+      description: >-
+        Experimento de span (RF06). Datos por ciclo (span configurado y efectivo, deficit cubierto,
+        costo frente al baseline, bids rechazados), agregado por valor de span y contrafactual del
+        libro de ofertas reconstruido desde el feed de mercado.
+      parameters:
+        - in: query
+          name: since
+          description: Inicio del periodo (ISO 8601). Por defecto, la apertura del mercado de produccion.
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: limit
+          description: Maximo de ciclos en el detalle (1 a 100, por defecto 50).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - in: query
+          name: onlyDeficit
+          description: Si es false, el detalle incluye ciclos sin deficit.
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: Resumen por span, detalle por ciclo y contrafactual del libro
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  since: { type: string, format: date-time }
+                  summary:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        spanSeconds: { type: integer }
+                        cycles: { type: integer }
+                        coveragePct: { type: number, nullable: true }
+                        avgEffectivePrice: { type: number, nullable: true }
+                        savingsPct: { type: number, nullable: true }
+                        bidsRejected: { type: integer }
+                        cyclesWithoutPurchase: { type: integer }
+                  cycles:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        cycleId: { type: string }
+                        opensAt: { type: string, format: date-time }
+                        spanConfigured: { type: integer }
+                        spanEffective: { type: integer, nullable: true }
+                        deficitKwh: { type: integer }
+                        coveredKwh: { type: integer }
+                        baseline: { type: number }
+                        realCost: { type: number }
+                        savings: { type: number }
+                        bidsRejected: { type: integer }
+                  book:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        spanSeconds: { type: integer }
+                        cycles: { type: integer }
+                        avgBestPrice: { type: number, nullable: true }
+                        avgMetPrice: { type: number, nullable: true }
+                        bestPricePctOfImbalance: { type: number, nullable: true }
+                        bookCoversDeficitPct: { type: number }
+                        cyclesWithoutOffers: { type: integer }
+        '422':
+          description: since invalido
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 components:
   securitySchemes:
     bearerAuth:

@@ -11,6 +11,7 @@ const seller = require('./seller');
 const buyer = require('./buyer/worker');
 const buyerConfig = require('./buyer/config');
 const strategyConfig = require('./config');
+const experiment = require('./experiment');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
@@ -401,6 +402,25 @@ app.get('/config/cycles/:cycleId', authenticate, async (req, res) => {
     res.json(cfg);
   } catch (err) {
     console.error('[config] Error leyendo configuración del ciclo:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// RF06: experimento de span. Datos por ciclo, agregado por span y contrafactual del libro.
+app.get('/experiment/span', authenticate, async (req, res) => {
+  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), MAX_PAGE_LIMIT);
+  try {
+    const since = experiment.parseSince(req.query.since);
+    const onlyDeficit = req.query.onlyDeficit !== 'false';
+    const [summary, cycles, book] = await Promise.all([
+      experiment.getSummary(pool, { since }),
+      experiment.getCycles(pool, { since, limit, onlyDeficit }),
+      experiment.getBookCounterfactual(pool, { since }),
+    ]);
+    res.json({ since, summary, cycles, book });
+  } catch (err) {
+    if (err.statusCode === 422) return res.status(422).json({ error: err.message });
+    console.error('[experiment] Error leyendo el experimento de span:', err.message);
     res.status(500).json({ error: 'Error interno' });
   }
 });
