@@ -9,6 +9,21 @@ function fail(message, statusCode = 422) {
   throw error;
 }
 
+const BID_REJECTED_CODES = {
+  QUANTITY_UNAVAILABLE: 409,
+  OFFER_WITHDRAWN: 410,
+  BID_TOO_SMALL: 422,
+  MARKET_CLOSED: 410,
+  SELF_TRADE: 422
+};
+const CLOSE_MARGIN_MS = 2_000;
+const MIN_SWAP_TTL_MS = 5_000;
+
+const toDate = (value) => {
+  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms) : null;
+};
+
 function round2(val) {
   return Math.round(val * 100) / 100;
 }
@@ -62,21 +77,54 @@ async function publishSellerOffer(pool, {
   imbalancePrice,
   offerId,
   cityId = OWN_CITY,
+  minBid = null,
+  lastOfferAt = null,
+  lastBidAt = null,
+  closesAt = null,
+  walletAvailable = true,
+  priceFactor = 0.85,
+  maxQuantity = null,
+  priceDecayMinutes = 0,
+  now = () => Date.now(),
   connectorUrl = CONNECTOR_URL,
   fetchFn = globalThis.fetch
 } = {}) {
   if (!Number.isInteger(sellable) || sellable <= 0) return null;
   if (!cycleId || typeof cycleId !== 'string') fail('cycleId requerido');
+  // Sin cliente de la wallet no se puede proponer ningún swap: ofrecer sería
+  // aceptar bids que nunca se van a liquidar.
+  if (!walletAvailable) {
+    console.warn(`[seller] Sin cliente de la wallet: no se publica oferta para ${cycleId}`);
+    return null;
+  }
+  const lastOffer = toDate(lastOfferAt);
+  if (lastOffer && now() >= lastOffer.getTime()) {
+    console.warn(`[seller] Pasó lastOfferAt de ${cycleId}: no se publica oferta`);
+    return null;
+  }
 
-  const pricePerEnergy = calculateSellerPrice({ generationCost, imbalancePrice });
+  // Configuración del ciclo (ADR 0006): tope de cantidad y factor de precio.
+  const quantity = Number.isInteger(maxQuantity) ? Math.min(sellable, maxQuantity) : sellable;
+  if (quantity <= 0) return null;
+  const pricePerEnergy = calculateSellerPrice({ generationCost, imbalancePrice, metDiscountFactor: priceFactor });
+  // Piso de la bajada: el mismo de calculateSellerPrice (1.05 × costo = recompra).
+  const floorPrice = round2(generationCost * 1.05);
+  const decayMinutes = Number.isInteger(priceDecayMinutes) && priceDecayMinutes > 0 ? priceDecayMinutes : 0;
   const finalOfferId = offerId || `${cityId}-${cycleId}-offer`;
 
   await createSellerOffer(pool, {
     offerId: finalOfferId,
     cycleId,
-    totalQuantity: sellable,
+    totalQuantity: quantity,
     pricePerEnergy,
-    cityId
+    cityId,
+    minBid,
+    lastBidAt,
+    closesAt,
+    floorPrice,
+    decayMinutes,
+    lastOfferAt,
+    publishedAt: new Date(now())
   });
 
   const envelope = {
@@ -84,7 +132,7 @@ async function publishSellerOffer(pool, {
     cycleId,
     data: {
       offerId: finalOfferId,
-      quantity: sellable,
+      quantity,
       pricePerEnergy
     }
   };
@@ -98,7 +146,7 @@ async function publishSellerOffer(pool, {
   return {
     offerId: finalOfferId,
     cycleId,
-    quantity: sellable,
+    quantity,
     pricePerEnergy
   };
 }
@@ -108,21 +156,26 @@ async function publishSellerOffer(pool, {
  */
 async function sendBidRejected({
   bidEvent,
+  reason = 'QUANTITY_UNAVAILABLE',
   available,
   connectorUrl = CONNECTOR_URL,
   fetchFn = globalThis.fetch
 } = {}) {
   if (!bidEvent || !bidEvent.cityId || !bidEvent.msgId || !connectorUrl) return null;
+  if (!Object.hasOwn(BID_REJECTED_CODES, reason)) fail(`Razón de bid-rejected desconocida: ${reason}`);
+  const data = {
+    target: bidEvent.msgId,
+    offerId: bidEvent.data?.offerId,
+    requested: bidEvent.data?.quantity
+  };
+  if (reason === 'QUANTITY_UNAVAILABLE') data.available = Math.max(0, available ?? 0);
   const envelope = {
     type: 'bid-rejected',
     cycleId: bidEvent.cycleId,
-    reason: 'QUANTITY_UNAVAILABLE',
-    code: 409,
+    reason,
+    code: BID_REJECTED_CODES[reason],
     routingKey: `city.${bidEvent.cityId}`,
-    data: {
-      target: bidEvent.msgId,
-      available: Math.max(0, available)
-    }
+    data
   };
 
   try {
@@ -230,9 +283,27 @@ async function publishOfferWithdrawn({
 }
 
 /**
+ * Interruptor de emergencia: retira las ofertas activas (las marca withdrawn y
+ * publica offer-withdrawn). Los bids que lleguen después se rechazan con
+ * OFFER_WITHDRAWN. Los swaps ya propuestos siguen su curso en la wallet.
+ */
+async function withdrawActiveOffers(pool, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const res = await pool.query(
+    `UPDATE seller_offers SET status = 'withdrawn', updated_at = now()
+     WHERE status = 'active'
+     RETURNING offer_id AS "offerId", cycle_id AS "cycleId"`
+  );
+  for (const offer of res.rows) {
+    await publishOfferWithdrawn({ ...offer, connectorUrl, fetchFn });
+  }
+  return res.rows;
+}
+
+/**
  * Registra o actualiza la oferta vendible del ciclo actual para nuestra ciudad.
  */
-async function createSellerOffer(pool, { offerId, cycleId, totalQuantity, pricePerEnergy, cityId = 'REE' }) {
+async function createSellerOffer(pool, { offerId, cycleId, totalQuantity, pricePerEnergy, cityId = 'REE', minBid = null, lastBidAt = null, closesAt = null,
+  floorPrice = null, decayMinutes = 0, lastOfferAt = null, publishedAt = null }) {
   if (!offerId || typeof offerId !== 'string') fail('offerId requerido');
   if (!cycleId || typeof cycleId !== 'string') fail('cycleId requerido');
   if (!Number.isInteger(totalQuantity) || totalQuantity <= 0) fail('totalQuantity debe ser entero positivo');
@@ -241,17 +312,30 @@ async function createSellerOffer(pool, { offerId, cycleId, totalQuantity, priceP
   }
 
   const { rows } = await pool.query(
-    `INSERT INTO seller_offers (offer_id, cycle_id, city_id, total_quantity, price_per_energy, status, updated_at)
-     VALUES ($1, $2, $3, $4, $5, 'active', now())
+    `INSERT INTO seller_offers (offer_id, cycle_id, city_id, total_quantity, price_per_energy, status, min_bid, last_bid_at, closes_at,
+                                start_price, floor_price, decay_minutes, last_offer_at, published_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $5, $9, $10, $11, $12, now())
      ON CONFLICT (offer_id) DO UPDATE SET
        total_quantity = EXCLUDED.total_quantity,
        price_per_energy = EXCLUDED.price_per_energy,
        status = 'active',
+       min_bid = COALESCE(EXCLUDED.min_bid, seller_offers.min_bid),
+       last_bid_at = COALESCE(EXCLUDED.last_bid_at, seller_offers.last_bid_at),
+       closes_at = COALESCE(EXCLUDED.closes_at, seller_offers.closes_at),
+       start_price = EXCLUDED.start_price,
+       floor_price = EXCLUDED.floor_price,
+       decay_minutes = EXCLUDED.decay_minutes,
+       last_offer_at = COALESCE(EXCLUDED.last_offer_at, seller_offers.last_offer_at),
+       published_at = COALESCE(EXCLUDED.published_at, seller_offers.published_at),
        updated_at = now()
      RETURNING offer_id AS "offerId", cycle_id AS "cycleId", city_id AS "cityId",
                total_quantity AS "totalQuantity", price_per_energy::text AS "pricePerEnergy",
                status`,
-    [offerId, cycleId, cityId, totalQuantity, round2(pricePerEnergy)]
+    [offerId, cycleId, cityId, totalQuantity, round2(pricePerEnergy),
+      Number.isInteger(minBid) && minBid > 0 ? minBid : null, toDate(lastBidAt), toDate(closesAt),
+      Number.isFinite(floorPrice) && floorPrice > 0 ? round2(Math.min(floorPrice, pricePerEnergy)) : null,
+      Number.isInteger(decayMinutes) && decayMinutes > 0 ? decayMinutes : 0,
+      toDate(lastOfferAt), toDate(publishedAt)]
   );
   return rows[0];
 }
@@ -279,7 +363,14 @@ async function getSellerOffer(pool, offerId) {
  * Procesa un bid entrante de manera estrictamente serializada por oferta usando advisory lock.
  * Gestiona idempotencia por idpk (RF05) y reserva inventario antes de llamar a la wallet.
  */
-async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffsetMs = 45_000, connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+async function processIncomingBid(pool, bidEvent, {
+  walletClient,
+  requireWallet = false,
+  expiresAtOffsetMs = 45_000,
+  now = () => Date.now(),
+  connectorUrl = CONNECTOR_URL,
+  fetchFn = globalThis.fetch
+} = {}) {
   if (!bidEvent || typeof bidEvent !== 'object') fail('Evento bid inválido');
   const idpk = bidEvent.idpk;
   if (!idpk || typeof idpk !== 'string') fail('bid requiere idpk');
@@ -287,15 +378,23 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
   const data = bidEvent.data || {};
   const offerId = data.offerId;
   const quantity = data.quantity;
-  const pricePerEnergy = data.pricePerEnergy;
   const buyerCityId = bidEvent.cityId;
   const cycleId = bidEvent.cycleId;
   const userId = bidEvent.userId;
 
   if (!offerId || typeof offerId !== 'string') fail('bid requiere data.offerId');
   if (!Number.isInteger(quantity) || quantity <= 0) fail('bid requiere data.quantity entero positivo');
-  if (typeof pricePerEnergy !== 'number' || !Number.isFinite(pricePerEnergy) || pricePerEnergy <= 0) {
-    fail('bid requiere data.pricePerEnergy numérico positivo');
+
+  // Rechazos que no dependen del estado de la oferta (no se reserva nada).
+  const rejectEarly = async (reason) => {
+    await sendBidRejected({ bidEvent, reason, available: 0, connectorUrl, fetchFn }).catch(() => null);
+    return { accepted: false, duplicate: false, reason, available: 0 };
+  };
+  if (buyerCityId === OWN_CITY) return rejectEarly('SELF_TRADE');
+  // Sin cliente de la wallet el swap nunca se propondría y la cantidad quedaría
+  // reservada para siempre.
+  if (requireWallet && !(walletClient && typeof walletClient.proposeSwap === 'function')) {
+    return rejectEarly('OFFER_WITHDRAWN');
   }
 
   // Validación defensiva de identidad (RF05 / AGENTS.md):
@@ -390,38 +489,62 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
 
     // 3. Verificar estado de la oferta y calcular inventario disponible
     const offerRes = await client.query(
-      `SELECT o.total_quantity, o.price_per_energy, o.status,
+      `SELECT o.total_quantity, o.price_per_energy, o.status, o.min_bid, o.last_bid_at, o.closes_at,
               (o.total_quantity - COALESCE(SUM(b.requested_quantity) FILTER (WHERE b.status IN ('reserved', 'proposed', 'settled')), 0))::int AS available
        FROM seller_offers o
        LEFT JOIN seller_bids b ON b.offer_id = o.offer_id
        WHERE o.offer_id = $1
-       GROUP BY o.total_quantity, o.price_per_energy, o.status`,
+       GROUP BY o.total_quantity, o.price_per_energy, o.status, o.min_bid, o.last_bid_at, o.closes_at`,
       [offerId]
     );
 
-    if (!offerRes.rowCount || offerRes.rows[0].status !== 'active') {
-      const reason = !offerRes.rowCount ? 'OFFER_NOT_FOUND' : 'OFFER_INACTIVE';
+    // Oferta inexistente: no se guarda el bid (seller_bids exige una oferta existente).
+    // Lanzar aquí respondería 500 y el connector reencolaría el bid sin fin.
+    if (!offerRes.rowCount) {
+      await client.query('COMMIT');
+      await sendBidRejected({ bidEvent, reason: 'OFFER_WITHDRAWN', connectorUrl, fetchFn }).catch(() => null);
+      return { accepted: false, reason: 'OFFER_WITHDRAWN', available: 0, duplicate: false };
+    }
+
+    // El bid no trae precio: el precio es el de la oferta y es final (protocolo v3).
+    const pricePerEnergy = Number(offerRes.rows[0].price_per_energy);
+
+    const offer = offerRes.rows[0];
+    const lastBidAt = toDate(offer.last_bid_at);
+    const closesAt = toDate(offer.closes_at);
+    let reason = null;
+    if (offer.status === 'closed' || (lastBidAt && now() >= lastBidAt.getTime())) reason = 'MARKET_CLOSED';
+    else if (offer.status === 'withdrawn') reason = 'OFFER_WITHDRAWN';
+    else if (offer.status !== 'active') reason = 'QUANTITY_UNAVAILABLE';
+    else if (Number.isInteger(offer.min_bid) && quantity < offer.min_bid) reason = 'BID_TOO_SMALL';
+
+    if (reason) {
       await client.query(
         `INSERT INTO seller_bids (idpk, offer_id, cycle_id, buyer_city_id, buyer_user_id, requested_quantity, price_per_energy, status, rejection_reason, raw_payload)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'rejected', $8, $9)`,
         [idpk, offerId, cycleId, buyerCityId, bidEvent.userId || null, quantity, round2(pricePerEnergy), reason, JSON.stringify(bidEvent)]
       );
       await client.query('COMMIT');
-      return { accepted: false, reason, available: 0, duplicate: false };
+      const available = reason === 'QUANTITY_UNAVAILABLE' ? 0 : offer.available;
+      await sendBidRejected({ bidEvent, reason, available, connectorUrl, fetchFn }).catch(() => null);
+      return { accepted: false, reason, available, duplicate: false };
     }
 
-    const { available, price_per_energy: offerPrice } = offerRes.rows[0];
-
-    // Verificar si el precio ofertado es menor al estipulado
-    if (round2(pricePerEnergy) < Number(offerPrice)) {
+    // El swap tiene que vencer antes del cierre del mercado (máximo 60 s según la wallet).
+    let expiresAtMs = now() + Math.min(expiresAtOffsetMs, 60_000);
+    if (closesAt) expiresAtMs = Math.min(expiresAtMs, closesAt.getTime() - CLOSE_MARGIN_MS);
+    if (expiresAtMs - now() < MIN_SWAP_TTL_MS) {
       await client.query(
         `INSERT INTO seller_bids (idpk, offer_id, cycle_id, buyer_city_id, buyer_user_id, requested_quantity, price_per_energy, status, rejection_reason, raw_payload)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'rejected', 'PRICE_TOO_LOW', $8)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'rejected', 'MARKET_CLOSED', $8)`,
         [idpk, offerId, cycleId, buyerCityId, bidEvent.userId || null, quantity, round2(pricePerEnergy), JSON.stringify(bidEvent)]
       );
       await client.query('COMMIT');
-      return { accepted: false, reason: 'PRICE_TOO_LOW', available, duplicate: false };
+      await sendBidRejected({ bidEvent, reason: 'MARKET_CLOSED', connectorUrl, fetchFn }).catch(() => null);
+      return { accepted: false, reason: 'MARKET_CLOSED', available: offer.available, duplicate: false };
     }
+
+    const { available } = offer;
 
     // 4. ¿Alcanza el stock para este bid?
     if (quantity <= available) {
@@ -441,7 +564,8 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
         pricePerEnergy: round2(pricePerEnergy),
         available: available - quantity,
         offerId,
-        buyerCityId
+        buyerCityId,
+        expiresAt: new Date(expiresAtMs).toISOString()
       };
     } else {
       // Stock insuficiente: rechazar con QUANTITY_UNAVAILABLE e informar remanente
@@ -472,26 +596,32 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
   // 5. Fuera de la transacción y del lock: si fue aceptado y contamos con cliente de wallet, proponemos el swap
   if (decision && decision.accepted && walletClient && typeof walletClient.proposeSwap === 'function') {
     try {
-      const expiresAt = new Date(Date.now() + expiresAtOffsetMs).toISOString();
       const swapResult = await walletClient.proposeSwap({
         give: { asset: 'KWH', amount: decision.quantity },
         take: { asset: 'CR', amount: round2(decision.quantity * decision.pricePerEnergy) },
-        expiresAt,
-        memo: `bid:${idpk}`
+        expiresAt: decision.expiresAt,
+        // El comprador verifica que el memo del token sea el offerId.
+        memo: offerId
       }, { idpk: decision.swapIdpk });
-
-      const swapId = swapResult?.swap?.swapId || swapResult?.swapId || null;
-      await pool.query(
-        `UPDATE seller_bids
-         SET status = 'proposed', swap_id = COALESCE($1, swap_id), updated_at = now()
-         WHERE idpk = $2`,
-        [swapId, idpk]
-      );
-      decision.status = 'proposed';
-      decision.swapId = swapId;
+      // El 202 solo significa "recibido": el bid pasa a 'proposed' y se envía
+      // bid-accepted cuando llega el evento swap-proposed (handleSwapProposed).
+      decision.walletStatus = swapResult?.status || null;
+      // 'failed' = la wallet rechazó la petición en forma definitiva (401/404/422):
+      // el swap no existe, así que la cantidad se libera y se avisa al comprador.
+      // 'pending' (sin respuesta definitiva) mantiene la reserva: puede haberse procesado.
+      if (decision.walletStatus === 'failed') {
+        await releaseAndReject(pool, { idpk, bidEvent, connectorUrl, fetchFn });
+        decision.accepted = false;
+        decision.reason = 'QUANTITY_UNAVAILABLE';
+      }
     } catch (walletErr) {
       console.error(`[seller] Error al proponer swap a wallet para bid ${idpk}:`, walletErr.message);
-      // Queda en 'reserved' para reintento
+      const isTimeout = walletErr.name === 'TimeoutError' || /timed?\s*out/i.test(walletErr.message || '');
+      if (!isTimeout) {
+        await releaseAndReject(pool, { idpk, bidEvent, connectorUrl, fetchFn });
+        decision.accepted = false;
+        decision.reason = 'QUANTITY_UNAVAILABLE';
+      }
     }
   }
 
@@ -520,20 +650,97 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
 }
 
 /**
- * Transiciona el bid a 'proposed' y vincula swap_id cuando la wallet notifica swap-proposed.
- * Resuelve la Anomalía 4 de la demo (escrituras que sufrieron timeout pero sí fueron creadas).
+ * Libera la reserva de un bid cuyo swap no llegó a existir y avisa al comprador
+ * con QUANTITY_UNAVAILABLE y el disponible actual, para que pueda reintentar.
  */
-async function handleSwapProposed(pool, { swapIdpk, swapId }) {
-  if (!swapIdpk && !swapId) fail('swapIdpk o swapId requerido');
-  const res = await pool.query(
-    `UPDATE seller_bids
-     SET status = 'proposed', swap_id = COALESCE($1, swap_id), updated_at = now()
-     WHERE (swap_idpk = $2 OR ($1::text IS NOT NULL AND swap_id = $1))
-       AND status = 'reserved'
-     RETURNING idpk, offer_id AS "offerId", requested_quantity AS "requestedQuantity", status, swap_id AS "swapId"`,
-    [swapId || null, swapIdpk || null]
+async function releaseAndReject(pool, { idpk, bidEvent, connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch }) {
+  const { rows } = await pool.query(
+    `UPDATE seller_bids SET status = 'released', rejection_reason = 'WALLET_REJECTED', updated_at = now()
+     WHERE idpk = $1 AND status = 'reserved'
+     RETURNING offer_id AS "offerId"`,
+    [idpk]
   );
-  return res.rows[0] || null;
+  if (!rows.length) return null;
+  const offer = await getSellerOffer(pool, rows[0].offerId);
+  await sendBidRejected({ bidEvent, reason: 'QUANTITY_UNAVAILABLE', available: offer ? offer.available : 0, connectorUrl, fetchFn }).catch(() => null);
+  return offer;
+}
+
+/**
+ * Al llegar swap-proposed (la wallet ya retiene los kWh), marca el bid como
+ * 'proposed', guarda el swapId y envía bid-accepted al comprador con el token si viene provisto.
+ * El evento se aparea por data.idpk o swapIdpk.
+ */
+async function handleSwapProposed(pool, eventOrOpts, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const data = eventOrOpts?.data || eventOrOpts || {};
+  const swapId = data.swapId;
+  const swapIdpk = data.idpk || data.swapIdpk;
+  const token = data.token;
+  if (!swapIdpk && !swapId) fail('swapIdpk o swapId requerido');
+
+  const { rows } = await pool.query(
+    `UPDATE seller_bids
+     SET status = 'proposed', swap_id = COALESCE($2, swap_id), updated_at = now()
+     WHERE (($1::text IS NOT NULL AND swap_idpk::text = lower($1)) OR ($2::text IS NOT NULL AND swap_id = $2))
+       AND status IN ('reserved', 'proposed')
+     RETURNING idpk, offer_id AS "offerId", cycle_id AS "cycleId", buyer_city_id AS "buyerCityId",
+               requested_quantity AS "quantity", requested_quantity AS "requestedQuantity",
+               price_per_energy::float8 AS "pricePerEnergy", status, swap_id AS "swapId", raw_payload AS "rawPayload"`,
+    [swapIdpk || null, swapId || null]
+  );
+  const bid = rows[0];
+  if (!bid) return null;
+
+  if (token) {
+    const bidMsgId = bid.rawPayload?.msgId;
+    if (bidMsgId) {
+      const envelope = {
+        type: 'bid-accepted',
+        cycleId: bid.cycleId,
+        routingKey: `city.${bid.buyerCityId}`,
+        data: {
+          target: bidMsgId,
+          offerId: bid.offerId,
+          quantity: bid.quantity,
+          pricePerEnergy: bid.pricePerEnergy,
+          amount: round2(bid.quantity * bid.pricePerEnergy),
+          swapId: swapId,
+          swapToken: token,
+          expiresAt: data.expiresAt
+        }
+      };
+      try {
+        await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+      } catch (err) {
+        console.error(`[seller] Error enviando bid-accepted a ${bid.buyerCityId}:`, err.message);
+      }
+      return envelope;
+    }
+  }
+
+  return bid;
+}
+
+/**
+ * La wallet rechazó NUESTRA propuesta (swap-rejected con operation 'propose', por
+ * ejemplo INSUFFICIENT_ASSET): el swap no existe, el comprador nunca recibió
+ * bid-accepted. Se libera la cantidad y se le avisa con bid-rejected.
+ */
+async function handleProposalRejected(pool, { swapIdpk, swapId }, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  if (!swapIdpk && !swapId) return null;
+  const { rows } = await pool.query(
+    `UPDATE seller_bids
+     SET status = 'released', rejection_reason = 'PROPOSAL_REJECTED', updated_at = now()
+     WHERE (($1::text IS NOT NULL AND swap_idpk::text = lower($1)) OR ($2::text IS NOT NULL AND swap_id = $2))
+        AND status IN ('reserved', 'proposed')
+     RETURNING offer_id AS "offerId", raw_payload AS "rawPayload"`,
+    [swapIdpk || null, swapId || null]
+  );
+  const bid = rows[0];
+  if (!bid) return null;
+  const offer = await getSellerOffer(pool, bid.offerId);
+  await sendBidRejected({ bidEvent: bid.rawPayload, reason: 'QUANTITY_UNAVAILABLE', available: offer ? offer.available : 0, connectorUrl, fetchFn }).catch(() => null);
+  return bid;
 }
 
 /**
@@ -568,11 +775,100 @@ async function handleSwapReleased(pool, { swapIdpk, swapId, reason = 'SWAP_EXPIR
   return res.rows[0] || null;
 }
 
+/**
+ * Libera la cantidad de un swap que terminó sin liquidarse (vencido, cancelado o
+ * con el accept del comprador rechazado) y, si la oferta sigue activa, publica
+ * offer-updated con el remanente corregido para que los compradores lo vean.
+ */
+async function releaseSwap(pool, { swapIdpk = null, swapId = null, reason }, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const released = await handleSwapReleased(pool, { swapIdpk, swapId, reason });
+  if (!released) return null;
+  const offer = await getSellerOffer(pool, released.offerId);
+  if (offer && offer.status === 'active') {
+    await publishOfferUpdated({
+      offerId: offer.offerId,
+      cycleId: offer.cycleId,
+      remaining: offer.available,
+      pricePerEnergy: Number(offer.pricePerEnergy),
+      connectorUrl,
+      fetchFn
+    });
+  }
+  return released;
+}
+
+/**
+ * Bajada de precio durante el ciclo (ADR 0006). Cada minuto desde que se publicó,
+ * el precio baja en línea recta desde start_price hasta floor_price, al que llega
+ * en decay_minutes. No baja después de lastOfferAt (ya no se aceptan offer-updated)
+ * ni de una oferta retirada o agotada. Cada baja se publica con offer-updated.
+ *
+ * Se toma el mismo lock que processIncomingBid para que un bid no se reserve con
+ * un precio que ya se reemplazó. El UPDATE solo baja (price > nuevo), así que dos
+ * instancias o dos ticks seguidos no publican dos veces el mismo escalón.
+ */
+function decayedPrice({ startPrice, floorPrice, decayMinutes, publishedAt, at }) {
+  if (!(decayMinutes > 0) || !(startPrice > floorPrice)) return null;
+  const steps = Math.floor((at - publishedAt) / 60_000);
+  if (steps <= 0) return null;
+  const frac = Math.min(1, steps / decayMinutes);
+  return Math.max(floorPrice, round2(startPrice - (startPrice - floorPrice) * frac));
+}
+
+async function decayOfferPrices(pool, { now = () => Date.now(), connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const { rows } = await pool.query(
+    `SELECT offer_id AS "offerId", cycle_id AS "cycleId", price_per_energy::float8 AS price,
+            start_price::float8 AS "startPrice", floor_price::float8 AS "floorPrice",
+            decay_minutes AS "decayMinutes", published_at AS "publishedAt", last_offer_at AS "lastOfferAt"
+     FROM seller_offers
+     WHERE status = 'active' AND decay_minutes > 0 AND published_at IS NOT NULL
+       AND start_price IS NOT NULL AND floor_price IS NOT NULL AND price_per_energy > floor_price`
+  );
+  const changed = [];
+  for (const o of rows) {
+    const at = now();
+    if (o.lastOfferAt && at >= new Date(o.lastOfferAt).getTime()) continue;
+    const target = decayedPrice({ ...o, publishedAt: new Date(o.publishedAt).getTime(), at });
+    if (target === null || target >= o.price) continue;
+
+    const client = await pool.connect();
+    let updated = false;
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [o.offerId]);
+      const res = await client.query(
+        `UPDATE seller_offers SET price_per_energy = $2, updated_at = now()
+         WHERE offer_id = $1 AND status = 'active' AND price_per_energy > $2`,
+        [o.offerId, target]
+      );
+      await client.query('COMMIT');
+      updated = res.rowCount > 0;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    if (!updated) continue;
+
+    const offer = await getSellerOffer(pool, o.offerId);
+    if (offer && offer.available > 0) {
+      await publishOfferUpdated({ offerId: o.offerId, cycleId: o.cycleId, remaining: offer.available, pricePerEnergy: target, connectorUrl, fetchFn });
+    }
+    changed.push({ offerId: o.offerId, pricePerEnergy: target });
+  }
+  return changed;
+}
+
 module.exports = {
+  decayedPrice,
+  decayOfferPrices,
+  releaseSwap,
   createSellerOffer,
   getSellerOffer,
   processIncomingBid,
   handleSwapProposed,
+  handleProposalRejected,
   handleSwapSettled,
   handleSwapReleased,
   calculateSellerPrice,
@@ -582,5 +878,6 @@ module.exports = {
   cityFromUserId,
   publishOfferUpdated,
   publishOfferWithdrawn,
+  withdrawActiveOffers,
   dispatchToConnector
 };

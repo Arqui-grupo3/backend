@@ -1,0 +1,9 @@
+ALTER TABLE strategy_config
+  ADD COLUMN IF NOT EXISTS price_decay_minutes INTEGER NOT NULL DEFAULT 6
+  CHECK (price_decay_minutes BETWEEN 0 AND 8);
+
+ALTER TABLE seller_offers ADD COLUMN IF NOT EXISTS start_price NUMERIC(18, 2);
+ALTER TABLE seller_offers ADD COLUMN IF NOT EXISTS floor_price NUMERIC(18, 2);
+ALTER TABLE seller_offers ADD COLUMN IF NOT EXISTS decay_minutes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE seller_offers ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
+ALTER TABLE seller_offers ADD COLUMN IF NOT EXISTS last_offer_at TIMESTAMPTZ;

@@ -8,12 +8,16 @@ const WINDOW = 5 * 60_000;
 async function onEvent(client, event) {
   if (event.type === 'status-statement') {
     const closesAt = new Date(event.data.validUntil);
+    // v3: la central publica el instante exacto en que abre el periodo de cierre.
+    // Si no viene (E1), se usa la regla anterior: 5 minutos antes de validUntil.
+    const opens = new Date(event.data.market?.reportOpensAt);
+    const dueAt = Number.isFinite(+opens) && +opens < +closesAt ? opens : new Date(+closesAt - WINDOW);
     await client.query(`INSERT INTO report_jobs(cycle_id,idpk,due_at,closes_at,source_timestamp)
       VALUES ($1,$2,$3,$4,$5) ON CONFLICT(cycle_id) DO UPDATE SET
       due_at=EXCLUDED.due_at, closes_at=EXCLUDED.closes_at, source_timestamp=EXCLUDED.source_timestamp
       WHERE report_jobs.attempts=0 AND report_jobs.status='pending'
         AND EXCLUDED.source_timestamp >= report_jobs.source_timestamp`,
-    [event.cycleId,randomUUID(),new Date(+closesAt-WINDOW),closesAt,event.timestamp]);
+    [event.cycleId,randomUUID(),dueAt,closesAt,event.timestamp]);
     return;
   }
   if (!['ack','nack','error'].includes(event.type) || event.sender !== 'central') return;
@@ -70,16 +74,19 @@ async function claim(pool, now) {
     if (!job.payload) {
       const state = await getCycleState(client,job.cycle_id);
       // Partial or in-flight negotiations must not silently report partial balances.
+      // Solo las del ciclo que se reporta: eventos de la E1 de otros ciclos no deben
+      // bloquear los reportes de la E2 (la negociación con la central fue retirada).
       const unsupported = await client.query(`
         SELECT 1 FROM events e
-        WHERE e.type IN ('negotiation-proposal','give','take')
+        WHERE e.cycle_id = $1
+          AND e.type IN ('negotiation-proposal','give','take')
           AND NOT EXISTS (
             SELECT 1 FROM negotiation_jobs j
             WHERE (j.last_msg_id = e.msg_id OR j.confirmation_msg_id = e.msg_id)
               AND j.status IN ('paid', 'failed', 'expired')
           )
         LIMIT 1
-      `);
+      `, [job.cycle_id]);
       if (!state?.initialized || unsupported.rowCount) {
         await client.query("UPDATE report_jobs SET status='blocked',last_error=$2,updated_at=$3 WHERE cycle_id=$1",
           [job.cycle_id,unsupported.rowCount ? 'Voluntary negotiations not accounted for' : 'Missing status-statement',now]);

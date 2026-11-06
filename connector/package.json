@@ -5,7 +5,8 @@
   "description": "Prueba de concepto: conexion al broker RabbitMQ de EnergyShark (IIC2173, Entrega 0)",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "amqplib": "^0.10.4",

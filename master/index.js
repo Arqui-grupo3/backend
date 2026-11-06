@@ -8,18 +8,20 @@ const reports = require('./reports');
 const negotiations = require('./negotiations');
 const market = require('./market');
 const seller = require('./seller');
+const buyer = require('./buyer/worker');
+const buyerConfig = require('./buyer/config');
+const strategyConfig = require('./config');
+const experiment = require('./experiment');
 const reconciliation = require('./reconciliation');
 const admin = require('./admin');
 const cycles = require('./cycles');
 const { createWalletClient } = require('./wallet');
 
-const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
-if (REPORTS_ENABLED && process.env.LEDGER_BASELINE_CONFIRMED !== 'true') {
-  throw new Error('Reportes requieren LEDGER_BASELINE_CONFIRMED=true tras verificar el saldo inicial.');
-}
+const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
 
 let wallet = null;
 let walletWorker;
+let buyerWorker;
 let reportWorker;
 let negotiationWorker;
 
@@ -148,7 +150,6 @@ async function initDb() {
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_received_at ON api_audit (received_at DESC);');
       await pool.query('CREATE INDEX IF NOT EXISTS idx_api_audit_reason ON api_audit (reason);');
 
-      // Tabla unificada de auditoría y rechazados (persistanceDev)
       await pool.query(`
         CREATE TABLE IF NOT EXISTS rejected_messages (
           id UUID PRIMARY KEY,
@@ -191,8 +192,10 @@ app.get('/health', async (req, res) => {
     const negotiator = negotiationWorker?.health || { enabled: false };
     const reporterHealthy = !reporter.enabled || (!reporter.lastError && Date.now() - Date.parse(reporter.lastTick || reporter.startedAt) < 60000);
     const negotiatorHealthy = !negotiator.enabled || (!negotiator.lastError && Date.now() - Date.parse(negotiator.lastTick || negotiator.startedAt) < 60000);
-    const healthy = reporterHealthy && negotiatorHealthy;
-    res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'error', uptime: process.uptime(), count: result.rows[0].count, reporter, negotiator });
+    const buyerHealth = buyerWorker?.health || { enabled: false };
+    const buyerHealthy = !buyerHealth.enabled || (!buyerHealth.lastError && Date.now() - Date.parse(buyerHealth.lastTick || buyerHealth.startedAt) < 60000);
+    const healthy = reporterHealthy && negotiatorHealthy && buyerHealthy;
+    res.status(healthy ? 200 : 503).json({ status: healthy ? 'ok' : 'error', uptime: process.uptime(), count: result.rows[0].count, reporter, negotiator, buyer: buyerHealth });
   } catch (err) {
     res.status(500).json({ status: 'error', error: err.message });
   }
@@ -202,6 +205,7 @@ async function insertEvent(event) {
   const result = await ledger.recordEvent(pool, event);
   reportWorker?.wake();
   negotiationWorker?.wake();
+  buyerWorker?.wake();
   return result;
 }
 
@@ -222,12 +226,32 @@ async function forwardToConnector(path, body) {
 app.post('/market', async (req, res) => {
      try {
        const result = await market.recordMarketMessage(pool, req.body);
+       buyerWorker?.wake();
        res.status(result.duplicate ? 200 : 201).json(result);
      } catch (err) {
        if (err.statusCode !== 422) console.error('[master] Error al guardar mensaje de mercado:', err.message);
        res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el mensaje de mercado' });
      }
    });
+
+app.get('/buyer/config', authenticate, async (req, res) => {
+  try { res.json(await buyerConfig.getConfig(pool)); }
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+// Alias de /config (ADR 0006): spanSeconds y enabled (= marketEnabled) quedan en la misma
+// configuración versionada que usa el vendedor. Apagar aquí apaga también al vendedor.
+app.put('/buyer/config', authenticate, async (req, res) => {
+  try {
+    const { previous, ...config } = await buyerConfig.setConfig(pool, req.body);
+    let withdrawn = [];
+    if (previous.enabled && !config.enabled) {
+      withdrawn = await seller.withdrawActiveOffers(pool, { connectorUrl: CONNECTOR_URL });
+    }
+    buyerWorker?.wake();
+    console.log(`[config] Nueva versión ${config.version} vía /buyer/config`, JSON.stringify(req.body));
+    res.json({ ...config, withdrawnOffers: withdrawn.map((o) => o.offerId) });
+  } catch (error) { res.status(error.statusCode || 500).json({ error: error.statusCode === 422 ? error.message : 'Error interno' }); }
+});
 
 app.post('/seller/offer', async (req, res) => {
   try {
@@ -264,7 +288,7 @@ app.post('/events', async (req, res) => {
 
   if (type === 'bid') {
     try {
-      const decision = await seller.processIncomingBid(pool, { ...body, receivedAt: receivedAtValue }, { walletClient: wallet });
+      const decision = await seller.processIncomingBid(pool, { ...body, receivedAt: receivedAtValue }, { walletClient: wallet, requireWallet: true });
       return res.status(200).json({ idpk, type: 'bid', decision });
     } catch (err) {
       console.error('[master] Error al procesar bid:', err.message);
@@ -288,32 +312,63 @@ app.post('/events', async (req, res) => {
 
     if (type === 'status-statement') {
       const energy = body.data?.energy || {};
+      const market = body.data?.market || {};
       const capacity = energy.generationCapacity || 0;
       const consumption = energy.consumption || 0;
       const generationCost = energy.generationCost || 0;
-      const sellable = Math.floor(Math.max(0, capacity - consumption));
-      if (sellable > 0) {
-        const imbalancePrice = body.data?.imbalancePrice || (generationCost * 3);
+      const sellable = Number.isInteger(energy.sellable) ? energy.sellable : Math.floor(Math.max(0, capacity - consumption));
+      let cycleConfig = null;
+      try {
+        cycleConfig = await strategyConfig.freezeForCycle(pool, body.cycleId);
+      } catch (err) {
+        console.error(`[config] No se pudo congelar la configuración de ${body.cycleId}:`, err.message);
+      }
+      if (cycleConfig && !cycleConfig.marketEnabled) {
+        console.warn(`[config] Mercado apagado: no se publica oferta en ${body.cycleId}`);
+      }
+      if (sellable > 0 && cycleConfig?.marketEnabled) {
+        let imbalancePrice = market.imbalancePrice;
+        if (!Number.isFinite(imbalancePrice)) {
+          console.warn(`[seller] status-statement sin market.imbalancePrice en ${body.cycleId}; se usa 3 × costo propio`);
+          imbalancePrice = generationCost * 3;
+        }
         seller.publishSellerOffer(pool, {
           cycleId: body.cycleId,
           sellable,
           generationCost,
           imbalancePrice,
+          minBid: market.minBid,
+          lastOfferAt: market.lastOfferAt,
+          lastBidAt: market.lastBidAt,
+          closesAt: market.closesAt,
+          walletAvailable: Boolean(wallet),
+          priceFactor: cycleConfig.priceFactor,
+          maxQuantity: cycleConfig.maxQuantity,
+          priceDecayMinutes: cycleConfig.priceDecayMinutes,
           connectorUrl: CONNECTOR_URL
         }).catch((err) => console.error('[seller] Error publicando oferta tras status-statement:', err.message));
       }
     }
 
     if (type === 'swap-proposed') {
-      const swapId = body.data?.swapId;
-      const swapIdpk = body.data?.idpk || idpk;
-      await seller.handleSwapProposed(pool, { swapId, swapIdpk }).catch((e) => console.error('[seller] swap-proposed handler error:', e.message));
+      await seller.handleSwapProposed(pool, body, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-proposed handler error:', e.message));
     } else if (type === 'swap-settled') {
       const swapId = body.data?.swapId;
-      await seller.handleSwapSettled(pool, { swapId, swapIdpk: idpk }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
-    } else if (type === 'swap-expired' || type === 'swap-rejected' || type === 'swap-cancelled') {
+      await seller.handleSwapSettled(pool, { swapId }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
+    } else if (type === 'swap-expired' || type === 'swap-cancelled') {
       const swapId = body.data?.swapId;
-      await seller.handleSwapReleased(pool, { swapId, swapIdpk: idpk, reason: type }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
+      const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
+      await seller.releaseSwap(pool, { swapId, swapIdpk, reason: type }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
+    } else if (type === 'swap-rejected' && body.data?.operation === 'accept') {
+      const swapId = body.data?.swapId;
+      if (swapId) {
+        console.warn(`[seller] El comprador no pudo aceptar ${swapId}: ${body.reason || body.data?.message || 'swap-rejected'}`);
+        await seller.releaseSwap(pool, { swapId, reason: 'ACCEPT_REJECTED' }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected (accept) handler error:', e.message));
+      }
+    } else if (type === 'swap-rejected' && body.data?.operation === 'propose') {
+      const swapId = body.data?.swapId;
+      const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
+      await seller.handleProposalRejected(pool, { swapId, swapIdpk }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected handler error:', e.message));
     } else if (type === 'imbalance-settlement') {
       const cycleId = body.cycleId;
       if (cycleId) {
@@ -327,6 +382,72 @@ app.post('/events', async (req, res) => {
   } catch (err) {
     console.error('[master] Error al guardar evento:', err.message);
     res.status(err.statusCode || 500).json({ error: err.statusCode === 422 ? err.message : 'Error interno al guardar el evento' });
+  }
+});
+
+app.get('/config', authenticate, async (req, res) => {
+  try {
+    res.json(await strategyConfig.getCurrent(pool));
+  } catch (err) {
+    console.error('[config] Error leyendo configuración:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.get('/config/history', authenticate, async (req, res) => {
+  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 20, 1), MAX_PAGE_LIMIT);
+  try {
+    res.json({ items: await strategyConfig.getHistory(pool, limit) });
+  } catch (err) {
+    console.error('[config] Error leyendo historial:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.get('/config/cycles/:cycleId', authenticate, async (req, res) => {
+  try {
+    const cfg = await strategyConfig.getForCycle(pool, req.params.cycleId);
+    if (!cfg) return res.status(404).json({ error: 'Ciclo sin configuración congelada' });
+    res.json(cfg);
+  } catch (err) {
+    console.error('[config] Error leyendo configuración del ciclo:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+// RF06: experimento de span. Datos por ciclo, agregado por span y contrafactual del libro.
+app.get('/experiment/span', authenticate, async (req, res) => {
+  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 50, 1), MAX_PAGE_LIMIT);
+  try {
+    const since = experiment.parseSince(req.query.since);
+    const onlyDeficit = req.query.onlyDeficit !== 'false';
+    const [summary, cycles, book] = await Promise.all([
+      experiment.getSummary(pool, { since }),
+      experiment.getCycles(pool, { since, limit, onlyDeficit }),
+      experiment.getBookCounterfactual(pool, { since }),
+    ]);
+    res.json({ since, summary, cycles, book });
+  } catch (err) {
+    if (err.statusCode === 422) return res.status(422).json({ error: err.message });
+    console.error('[experiment] Error leyendo el experimento de span:', err.message);
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.put('/config', authenticate, async (req, res) => {
+  try {
+    const result = await strategyConfig.updateConfig(pool, req.body, { updatedBy: req.auth?.sub || null });
+    let withdrawn = [];
+    if (result.previous.marketEnabled && !result.current.marketEnabled) {
+      withdrawn = await seller.withdrawActiveOffers(pool, { connectorUrl: CONNECTOR_URL });
+    }
+    buyerWorker?.wake();
+    console.log(`[config] Nueva versión ${result.current.version}`, JSON.stringify(req.body));
+    res.json({ ...result.current, withdrawnOffers: withdrawn.map((o) => o.offerId) });
+  } catch (err) {
+    if (err.statusCode === 422) return res.status(422).json({ error: err.message });
+    console.error('[config] Error actualizando configuración:', err.message);
+    res.status(500).json({ error: 'Error interno' });
   }
 });
 
@@ -411,7 +532,6 @@ app.patch('/audit/:id/response', async (req, res) => {
   }
 });
 
-// GET Audit ahora expone el flujo enriquecido de persistanceDev
 app.get('/audit', authenticate, async (req, res) => {
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
@@ -583,6 +703,7 @@ app.post('/negotiations', authenticate, async (req, res) => {
   try {
     const job = await negotiations.createProposal(pool, { cycleId, direction, quantity, pricePerEnergy });
     negotiationWorker?.wake();
+  buyerWorker?.wake();
     return res.status(201).json(job);
   } catch (err) {
     console.error('[master] Error al crear propuesta:', err.message);
@@ -670,18 +791,12 @@ app.get('/history/:id', authenticate, async (req, res) => {
 
 app.get('/distance-table', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, idpk, type, package_body AS "data", received_at AS "receivedAt"
-       FROM events
-       WHERE type = 'distance-table'
-         AND jsonb_typeof(package_body->'distances') = 'object'
-       ORDER BY seq DESC
-       LIMIT 1`
-    );
-    if (result.rowCount === 0) {
+    const table = await market.getLatestDistanceTable(pool);
+    if (!table) {
       return res.status(404).json({ error: 'No hay una distance-table vigente registrada' });
     }
-    res.json(result.rows[0]);
+    const { id, idpk, type, data, receivedAt } = table;
+    res.json({ id, idpk, type, data, receivedAt });
   } catch (err) {
     console.error('[master] Error al consultar /distance-table:', err.message);
     res.status(500).json({ error: 'Error interno al consultar la distance-table vigente' });
@@ -690,14 +805,13 @@ app.get('/distance-table', authenticate, async (req, res) => {
 
 app.get('/connectivity', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, cycle_id AS "cycleId", package_body AS data, received_at AS "receivedAt"
-       FROM events
-       WHERE type = 'distance-table'
-       ORDER BY seq DESC
-       LIMIT 1`
-    );
-    res.json(result.rows[0] || null);
+    const table = await market.getLatestDistanceTable(pool);
+    res.json(table ? {
+      id: table.id,
+      cycleId: table.cycleId,
+      data: table.data,
+      receivedAt: table.receivedAt,
+    } : null);
   } catch (err) {
     console.error('[master] Error al consultar /connectivity:', err.message);
     res.status(500).json({ error: 'Error interno al consultar conectividad' });
@@ -740,9 +854,17 @@ initDb().then(() => {
      if (process.env.WALLET_BASE_URL && process.env.WALLET_API_KEY) {
      wallet = createWalletClient({ pool, baseUrl: process.env.WALLET_BASE_URL, apiKey: process.env.WALLET_API_KEY });
      walletWorker = wallet.startRetryWorker();
+     buyerWorker = buyer.startWorker(pool, { wallet, walletBaseUrl: process.env.WALLET_BASE_URL,
+       onTick: () => walletWorker.wake(), publishOptions: { connectorUrl: CONNECTOR_URL } });
    } else {
      console.warn('[master] Falta WALLET_BASE_URL o WALLET_API_KEY: cliente de la wallet deshabilitado');
    }
+
+  setInterval(() => {
+    seller.decayOfferPrices(pool, { connectorUrl: CONNECTOR_URL })
+      .then((changed) => changed.forEach((c) => console.log(`[seller] Precio de ${c.offerId} baja a ${c.pricePerEnergy}`)))
+      .catch((err) => console.error('[seller] Error bajando precio:', err.message));
+  }, 5000).unref();
 
   app.listen(PORT, () => {
     console.log(`[master] Escuchando en http://localhost:${PORT}`);
