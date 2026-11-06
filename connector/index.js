@@ -277,7 +277,7 @@ async function main() {
         const response = await fetch(MASTER_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...event, receivedAt, routingKey, delivery }),
+          body: JSON.stringify({ ...event, receivedAt, routingKey, delivery, userId }),
         });
 
         if (!response.ok) {

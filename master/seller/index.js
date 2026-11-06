@@ -187,6 +187,46 @@ async function sendBidRejected({
 }
 
 /**
+ * Extrae el código de ciudad de un userId con formato city.<CITY>.
+ */
+function cityFromUserId(userId) {
+  const match = typeof userId === 'string' ? userId.match(/^city\.([A-Z]{3})$/) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * Despacha un sobre nack hacia la ciudad compradora reportando el rechazo de protocolo.
+ */
+async function sendBidNack({
+  bidEvent,
+  reason = 'IDENTITY_MISMATCH',
+  code = 403,
+  message = 'user_id no corresponde al cityId indicado',
+  connectorUrl = CONNECTOR_URL,
+  fetchFn = globalThis.fetch
+} = {}) {
+  if (!bidEvent || !bidEvent.cityId || !bidEvent.msgId || !connectorUrl) return null;
+  const envelope = {
+    type: 'nack',
+    cycleId: bidEvent.cycleId,
+    reason,
+    code,
+    routingKey: `city.${bidEvent.cityId}`,
+    data: {
+      target: bidEvent.msgId,
+      message
+    }
+  };
+
+  try {
+    return await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+  } catch (err) {
+    console.error(`[seller] Error enviando nack a ${bidEvent.cityId}:`, err.message);
+    return null;
+  }
+}
+
+/**
  * Emite offer-updated al feed de mercado para actualizar el remaining público.
  */
 async function publishOfferUpdated({
@@ -340,6 +380,7 @@ async function processIncomingBid(pool, bidEvent, {
   const quantity = data.quantity;
   const buyerCityId = bidEvent.cityId;
   const cycleId = bidEvent.cycleId;
+  const userId = bidEvent.userId;
 
   if (!offerId || typeof offerId !== 'string') fail('bid requiere data.offerId');
   if (!Number.isInteger(quantity) || quantity <= 0) fail('bid requiere data.quantity entero positivo');
@@ -354,6 +395,48 @@ async function processIncomingBid(pool, bidEvent, {
   // reservada para siempre.
   if (requireWallet && !(walletClient && typeof walletClient.proposeSwap === 'function')) {
     return rejectEarly('OFFER_WITHDRAWN');
+  }
+
+  // Validación defensiva de identidad (RF05 / AGENTS.md):
+  // Si viene provisto userId, debe coincidir estrictamente con city.<cityId>
+  if (userId) {
+    const senderCity = cityFromUserId(userId);
+    if (!senderCity || senderCity !== buyerCityId) {
+      const detail = `user_id ${userId} no corresponde al cityId ${buyerCityId || '(ausente)'}.`;
+      await pool.query(
+        `INSERT INTO rejected_messages
+         (id, idpk, msg_id, type, category, reason, code, payload, received_at, routing_key, detail, response_status)
+         VALUES ($1, $2, $3, $4, 'NACK', 'IDENTITY_MISMATCH', 403, $5, $6, $7, $8, 'sent')`,
+        [
+          randomUUID(),
+          idpk,
+          bidEvent.msgId || null,
+          'bid',
+          JSON.stringify(bidEvent),
+          bidEvent.receivedAt || new Date().toISOString(),
+          `city.${buyerCityId}`,
+          detail
+        ]
+      );
+
+      await sendBidNack({
+        bidEvent,
+        reason: 'IDENTITY_MISMATCH',
+        code: 403,
+        message: detail,
+        connectorUrl,
+        fetchFn
+      }).catch(() => null);
+
+      return {
+        accepted: false,
+        duplicate: false,
+        nack: true,
+        reason: 'IDENTITY_MISMATCH',
+        code: 403,
+        detail
+      };
+    }
   }
 
   const client = await pool.connect();
@@ -377,6 +460,23 @@ async function processIncomingBid(pool, bidEvent, {
     if (existing.rowCount > 0) {
       const prev = existing.rows[0];
       const isAccepted = prev.status !== 'rejected';
+
+      // RF05: Registrar intento duplicado en la tabla de auditoría rejected_messages
+      await client.query(
+        `INSERT INTO rejected_messages
+         (id, idpk, msg_id, type, category, reason, payload, received_at, detail)
+         VALUES ($1, $2, $3, $4, 'DUPLICADO', 'DUPLICATE_IDPK', $5, $6, $7)`,
+        [
+          randomUUID(),
+          idpk,
+          bidEvent.msgId || null,
+          'bid',
+          JSON.stringify(bidEvent),
+          bidEvent.receivedAt || new Date().toISOString(),
+          `Bid duplicado recibido (idpk=${idpk}). Estado previo: ${prev.status}`
+        ]
+      );
+
       await client.query('COMMIT');
       return {
         duplicate: true,
@@ -515,11 +615,13 @@ async function processIncomingBid(pool, bidEvent, {
         decision.reason = 'QUANTITY_UNAVAILABLE';
       }
     } catch (walletErr) {
-      // Error antes de llegar a la wallet (validación local): no se envió nada.
       console.error(`[seller] Error al proponer swap a wallet para bid ${idpk}:`, walletErr.message);
-      await releaseAndReject(pool, { idpk, bidEvent, connectorUrl, fetchFn });
-      decision.accepted = false;
-      decision.reason = 'QUANTITY_UNAVAILABLE';
+      const isTimeout = walletErr.name === 'TimeoutError' || /timed?\s*out/i.test(walletErr.message || '');
+      if (!isTimeout) {
+        await releaseAndReject(pool, { idpk, bidEvent, connectorUrl, fetchFn });
+        decision.accepted = false;
+        decision.reason = 'QUANTITY_UNAVAILABLE';
+      }
     }
   }
 
@@ -566,48 +668,57 @@ async function releaseAndReject(pool, { idpk, bidEvent, connectorUrl = CONNECTOR
 
 /**
  * Al llegar swap-proposed (la wallet ya retiene los kWh), marca el bid como
- * 'proposed', guarda el swapId y envía bid-accepted al comprador con el token.
- * El evento se aparea por data.idpk, que es la Idempotency-Key de nuestra propuesta.
+ * 'proposed', guarda el swapId y envía bid-accepted al comprador con el token si viene provisto.
+ * El evento se aparea por data.idpk o swapIdpk.
  */
-async function handleSwapProposed(pool, event, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
-  const data = event?.data || {};
-  if (!data.idpk || !data.swapId || !data.token) return null;
+async function handleSwapProposed(pool, eventOrOpts, { connectorUrl = CONNECTOR_URL, fetchFn = globalThis.fetch } = {}) {
+  const data = eventOrOpts?.data || eventOrOpts || {};
+  const swapId = data.swapId;
+  const swapIdpk = data.idpk || data.swapIdpk;
+  const token = data.token;
+  if (!swapIdpk && !swapId) fail('swapIdpk o swapId requerido');
+
   const { rows } = await pool.query(
     `UPDATE seller_bids
-     SET status = 'proposed', swap_id = $2, updated_at = now()
-     WHERE swap_idpk::text = lower($1) AND status IN ('reserved', 'proposed')
+     SET status = 'proposed', swap_id = COALESCE($2, swap_id), updated_at = now()
+     WHERE (($1::text IS NOT NULL AND swap_idpk::text = lower($1)) OR ($2::text IS NOT NULL AND swap_id = $2))
+       AND status IN ('reserved', 'proposed')
      RETURNING idpk, offer_id AS "offerId", cycle_id AS "cycleId", buyer_city_id AS "buyerCityId",
-               requested_quantity AS "quantity", price_per_energy::float8 AS "pricePerEnergy", raw_payload AS "rawPayload"`,
-    [data.idpk, data.swapId]
+               requested_quantity AS "quantity", requested_quantity AS "requestedQuantity",
+               price_per_energy::float8 AS "pricePerEnergy", status, swap_id AS "swapId", raw_payload AS "rawPayload"`,
+    [swapIdpk || null, swapId || null]
   );
   const bid = rows[0];
-  if (!bid) return null; // no es una propuesta nuestra de venta
-  const bidMsgId = bid.rawPayload?.msgId;
-  if (!bidMsgId) {
-    console.error(`[seller] Bid ${bid.idpk} sin msgId: no se puede enviar bid-accepted`);
-    return null;
-  }
-  const envelope = {
-    type: 'bid-accepted',
-    cycleId: bid.cycleId,
-    routingKey: `city.${bid.buyerCityId}`,
-    data: {
-      target: bidMsgId,
-      offerId: bid.offerId,
-      quantity: bid.quantity,
-      pricePerEnergy: bid.pricePerEnergy,
-      amount: round2(bid.quantity * bid.pricePerEnergy),
-      swapId: data.swapId,
-      swapToken: data.token,
-      expiresAt: data.expiresAt
+  if (!bid) return null;
+
+  if (token) {
+    const bidMsgId = bid.rawPayload?.msgId;
+    if (bidMsgId) {
+      const envelope = {
+        type: 'bid-accepted',
+        cycleId: bid.cycleId,
+        routingKey: `city.${bid.buyerCityId}`,
+        data: {
+          target: bidMsgId,
+          offerId: bid.offerId,
+          quantity: bid.quantity,
+          pricePerEnergy: bid.pricePerEnergy,
+          amount: round2(bid.quantity * bid.pricePerEnergy),
+          swapId: swapId,
+          swapToken: token,
+          expiresAt: data.expiresAt
+        }
+      };
+      try {
+        await dispatchToConnector(connectorUrl, envelope, { fetchFn });
+      } catch (err) {
+        console.error(`[seller] Error enviando bid-accepted a ${bid.buyerCityId}:`, err.message);
+      }
+      return envelope;
     }
-  };
-  try {
-    await dispatchToConnector(connectorUrl, envelope, { fetchFn });
-  } catch (err) {
-    console.error(`[seller] Error enviando bid-accepted a ${bid.buyerCityId}:`, err.message);
   }
-  return envelope;
+
+  return bid;
 }
 
 /**
@@ -621,7 +732,7 @@ async function handleProposalRejected(pool, { swapIdpk, swapId }, { connectorUrl
     `UPDATE seller_bids
      SET status = 'released', rejection_reason = 'PROPOSAL_REJECTED', updated_at = now()
      WHERE (($1::text IS NOT NULL AND swap_idpk::text = lower($1)) OR ($2::text IS NOT NULL AND swap_id = $2))
-       AND status IN ('reserved', 'proposed')
+        AND status IN ('reserved', 'proposed')
      RETURNING offer_id AS "offerId", raw_payload AS "rawPayload"`,
     [swapIdpk || null, swapId || null]
   );
@@ -763,6 +874,8 @@ module.exports = {
   calculateSellerPrice,
   publishSellerOffer,
   sendBidRejected,
+  sendBidNack,
+  cityFromUserId,
   publishOfferUpdated,
   publishOfferWithdrawn,
   withdrawActiveOffers,

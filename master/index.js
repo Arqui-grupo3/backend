@@ -1,5 +1,5 @@
-require('newrelic');
 require('dotenv').config();
+require('newrelic');
 const express = require('express');
 const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
@@ -12,6 +12,9 @@ const buyer = require('./buyer/worker');
 const buyerConfig = require('./buyer/config');
 const strategyConfig = require('./config');
 const experiment = require('./experiment');
+const reconciliation = require('./reconciliation');
+const admin = require('./admin');
+const cycles = require('./cycles');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
@@ -366,6 +369,12 @@ app.post('/events', async (req, res) => {
       const swapId = body.data?.swapId;
       const swapIdpk = UUID_PATTERN.test(body.data?.idpk || '') ? body.data.idpk : null;
       await seller.handleProposalRejected(pool, { swapId, swapIdpk }, { connectorUrl: CONNECTOR_URL }).catch((e) => console.error('[seller] swap-rejected handler error:', e.message));
+    } else if (type === 'imbalance-settlement') {
+      const cycleId = body.cycleId;
+      if (cycleId) {
+        reconciliation.reconcileCycle({ pool, walletClient: wallet, cycleId })
+          .catch((e) => console.error('[reconciliation] Error en auto-conciliación al cierre:', e.message));
+      }
     }
 
     console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);
@@ -587,6 +596,17 @@ app.get('/cycles/:cycleId/ledger', authenticate, async (req, res) => {
   }
 });
 
+app.get('/cycles/:cycleId/reconciliation', authenticate, async (req, res) => {
+  try {
+    const rec = await reconciliation.getReconciliation(pool, req.params.cycleId);
+    if (!rec) return res.status(404).json({ error: 'Ciclo sin conciliacion registrada' });
+    res.json(rec);
+  } catch (err) {
+    console.error('[master] Error al consultar conciliacion:', err.message);
+    res.status(500).json({ error: 'Error al consultar conciliacion' });
+  }
+});
+
 app.get('/cycles', authenticate, async (req, res) => {
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), MAX_PAGE_LIMIT);
@@ -619,27 +639,62 @@ app.get('/cycles', authenticate, async (req, res) => {
 
 app.get('/cycles/:cycleId', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT cycle_id AS "cycleId",
-              COUNT(*)::int AS "operationCount",
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'status-statement'), '[]') AS "statusStatements",
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'transfer'), '[]') AS transfers,
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'demand-statement'), '[]') AS "demandStatements",
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type IN ('negotiation-proposal', 'give', 'take', 'transfer')), '[]') AS negotiations,
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'negotiation-report'), '[]') AS "negotiationReports",
-              (ARRAY_AGG(package_body ORDER BY seq DESC) FILTER (WHERE type = 'negotiation-report'))[1] AS "finalBalances",
-              (ARRAY_AGG(type ORDER BY seq DESC))[1] AS "lastOperationType",
-              (ARRAY_AGG(received_at ORDER BY seq DESC))[1] AS "lastOperationAt"
-       FROM events
-       WHERE cycle_id = $1
-       GROUP BY cycle_id`,
-      [req.params.cycleId]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ error: 'Ciclo no encontrado' });
-    return res.json(result.rows[0]);
+    const detail = await cycles.getCycleDetail(pool, req.params.cycleId);
+    if (!detail) return res.status(404).json({ error: 'Ciclo no encontrado' });
+    return res.json(detail);
   } catch (err) {
     console.error('[master] Error al consultar ciclo:', err.message);
     return res.status(500).json({ error: 'Error interno al consultar ciclo' });
+  }
+});
+
+app.get('/market/live', authenticate, async (req, res) => {
+  try {
+    const live = await market.getLiveMarket(pool);
+    return res.json(live);
+  } catch (err) {
+    console.error('[master] Error al consultar /market/live:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar mercado en vivo' });
+  }
+});
+
+app.get('/admin/config', authenticate, async (req, res) => {
+  try {
+    const config = await admin.getStrategyConfig(pool);
+    return res.json(config);
+  } catch (err) {
+    console.error('[master] Error al consultar /admin/config:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar configuracion' });
+  }
+});
+
+app.put('/admin/config', authenticate, async (req, res) => {
+  try {
+    const updated = await admin.updateStrategyConfig(pool, req.body || {});
+    return res.json(updated);
+  } catch (err) {
+    console.error('[master] Error al actualizar /admin/config:', err.message);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/admin/swaps', authenticate, async (req, res) => {
+  try {
+    const swaps = await admin.getActiveSwaps(pool);
+    return res.json(swaps);
+  } catch (err) {
+    console.error('[master] Error al consultar /admin/swaps:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar swaps' });
+  }
+});
+
+app.get('/experiment/span', authenticate, async (req, res) => {
+  try {
+    const experiment = await admin.getSpanExperimentData(pool);
+    return res.json(experiment);
+  } catch (err) {
+    console.error('[master] Error al consultar /experiment/span:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar experimento de span' });
   }
 });
 
