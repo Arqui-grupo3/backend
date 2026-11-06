@@ -45,3 +45,29 @@
 **Con la E2:** el flujo se retira (`TYPE_RETIRED`), pero toda escritura a la wallet usa `Idempotency-Key` y un 502 o 504 puede ser una operación procesada: es la misma regla de AD3, ahora sobre HTTP y con plazos de segundos.
 
 **Cambiaríamos:** generalizar la tabla a `wallet_ops`; ante un timeout, reintentar con la misma llave o leer el estado antes de reintentar a ciegas; respetar `Retry-After`; activar el reporte automático por defecto. Ver ADR 0004.
+## Incidente de producción · nodo sin persistir del 27-10 al 05-11
+
+Este incidente ocurrió en la E2 y toca a AD1 y AD2, así que lo dejamos aquí.
+
+**Qué pasó:**
+- El 27-10 (PR #41/#42, commit `984419e`) `recordEvent` empezó a insertar en `events` la columna `published_at`. La migración que la crea (`014-distance-publication.sql`) se agregó al repo y a los tests, pero **no a la lista de migraciones que `master` aplica al arrancar** (`ledger/index.js`, `migrate`).
+- En producción la columna nunca existió. Desde el deploy, cada `INSERT INTO events` falló y, como `recordEvent` es una sola transacción (AD2), se deshizo todo: event log, ledger, efectos de la wallet, ciclo del comprador y reporte. Último dato persistido: 27-10 21:45:58 UTC (`cycle-249302`).
+- Nadie lo detectó en 9 días. `connector` y `master` siguieron `healthy`: el healthcheck mide que el proceso consume y responde, no que persiste.
+- El 05-11 20:44 UTC el commit `29484ed` agregó la migración a la lista y puso las pruebas antes de cada deploy. Tras el deploy (20:53 UTC) el nodo procesó lo que quedaba en la cola: los ciclos 249732 a 249947 (02-11 al 05-11), todos fuera de su ventana.
+
+**Impacto:**
+- Ciclos 249303 a 249731 (unos 6 días): perdidos. El broker no conservó sus mensajes de `city.REE` y no hay rastro de ellos en `events` ni en el ledger.
+- El feed de mercado (`market.REE` → `market_feed`) sí siguió guardándose todos los días, porque se persiste en su propia transacción y no pasa por `recordEvent`. Eso confirma que el connector consumía bien y que la falla estaba solo en el camino de `POST /events`.
+- Ciclos 249732 a 249947: procesados tarde, sin oferta (`Pasó lastOfferAt`), sin compra y con el reporte vencido. `report_jobs` registra 488 reportes `expired`.
+- Cada ciclo sin reporte es una multa de 50 000 CR. Con unos 640 ciclos afectados, la multa es del orden de 30 M CR (cifra exacta en `/statement`, asientos `penalty`).
+- El experimento de span (RF06) perdió sus días de datos.
+
+**Por qué AD1 y AD2 no lo evitaron:**
+- AD1: el `ack` después de persistir hizo lo correcto (no se perdió nada que el broker aún tuviera), pero el reencolado sin límite que ya señalamos convirtió un error permanente en un reintento eterno, sin alerta.
+- AD2: la atomicidad hizo lo correcto (no quedó estado a medias), pero una sola transacción para todo hace que un error en una tabla auxiliar detenga también el event log.
+
+**Cambiaríamos:**
+- Una sola fuente para la lista de migraciones, usada por los tests y por `master` (o aplicar todo `migrations/` en orden). Así un test que pasa garantiza el mismo esquema que producción.
+- Pruebas obligatorias antes del deploy (hecho en `29484ed`).
+- Un healthcheck de `master` que falle si no persiste ningún evento en, por ejemplo, 25 minutos (un ciclo completo), y una alerta de New Relic sobre la tasa de respuestas 5xx de `POST /events`.
+- Tope de reentregas en el connector con una cola de mensajes muertos, como ya proponía el post-mortem de AD1: un error permanente queda visible en vez de reintentarse para siempre.
