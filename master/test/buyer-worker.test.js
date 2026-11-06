@@ -525,3 +525,37 @@ test('buyer: registra el transporte real sin recalcularlo con una ruta posterior
   );
   assert.equal(rows[0].amount, '-52.00');
 });
+
+test('buyer worker: un bid sin respuesta válida se libera tras el plazo y compra a otra oferta', async t => {
+  const f = await fixture(t);
+  await f.tick();
+  assert.equal(f.published[0].data.offerId, 'HGW-1');
+  await recordMarketMessage(f.pool, envelope('offer-updated', { offerId: 'MET-1', remaining: 100, pricePerEnergy: 0 }, { cityId: 'MET' }));
+  await f.pool.query("UPDATE buyer_bid_attempts SET started_at=clock_timestamp()-interval '20 seconds'");
+  await f.tick();
+  assert.equal((await bidState(f.pool)).status, 'sent');
+  assert.equal(f.published.length, 1);
+  await f.pool.query("UPDATE buyer_bid_attempts SET started_at=clock_timestamp()-interval '41 seconds'");
+  await f.tick();
+  const first = await bidState(f.pool);
+  assert.equal(first.status, 'released');
+  assert.equal(first.last_result.type, 'bid-timeout');
+  assert.equal(f.published.length, 2);
+  assert.equal(f.published[1].data.offerId, 'MET-1');
+  assert.equal(f.published[1].data.quantity, 26);
+  assert.equal((await f.pool.query('SELECT COUNT(*)::int AS n FROM wallet_ops')).rows[0].n, 0, 'nada retenido en la wallet');
+});
+
+test('buyer worker: un bid-accepted con token inválido no anula el bid, pero el plazo lo libera', async t => {
+  const f = await fixture(t);
+  await f.tick();
+  await recordEvent(f.pool, accepted(f.published[0].msgId, { swapToken: token(claimsFor({ memo: 'otra-oferta' })) }));
+  await f.tick();
+  assert.equal((await bidState(f.pool)).status, 'sent', 'un tercero no puede anular el bid con un token falso');
+  await f.pool.query("UPDATE buyer_bid_attempts SET started_at=clock_timestamp()-interval '41 seconds'");
+  await f.tick();
+  assert.equal((await bidState(f.pool)).status, 'released');
+  await recordEvent(f.pool, accepted(f.published[0].msgId));
+  await f.tick();
+  assert.equal((await f.pool.query("SELECT COUNT(*)::int AS n FROM wallet_ops WHERE operation='accept'")).rows[0].n, 0);
+});

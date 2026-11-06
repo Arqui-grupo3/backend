@@ -6,6 +6,7 @@ const { maxAffordable } = require('./budget');
 
 const noBudgetUntil = new Map();
 const NO_BUDGET_RETRY_MS = 30_000;
+const BID_RESPONSE_TIMEOUT_S = Number(process.env.BUYER_BID_RESPONSE_TIMEOUT_S) || 40;
 
 async function reconcile(pool, wallet, cityId) {
   const { rows } = await pool.query(`SELECT b.*, w.status AS wallet_status
@@ -51,6 +52,16 @@ async function runOnce(pool, { wallet, verifyToken, cityId = process.env.CITY_ID
       await processResponse(pool, response, { wallet, verifyToken, cityId });
     }
     await reconcile(pool, wallet, cityId);
+    await pool.query(`UPDATE buyer_bids b
+      SET status='released', updated_at=now(),
+          last_result=jsonb_build_object('type','bid-timeout','reason','NO_VALID_RESPONSE','afterSeconds',$1::int)
+      WHERE b.status='sent'
+        AND (SELECT MIN(a.started_at) FROM buyer_bid_attempts a WHERE a.bid_idpk=b.idpk)
+            < clock_timestamp() - make_interval(secs => $1::int)
+        AND NOT EXISTS (
+          SELECT 1 FROM buyer_responses r JOIN buyer_bid_attempts a ON a.bid_idpk=b.idpk
+          WHERE r.status='pending' AND lower(r.envelope->'data'->>'target') = a.msg_id::text)`,
+    [BID_RESPONSE_TIMEOUT_S]);
     await pool.query(`UPDATE buyer_bids b SET status='released', updated_at=now()
       FROM buyer_cycles c WHERE b.cycle_id=c.cycle_id AND b.status IN ('reserved','sent')
       AND c.closes_at <= clock_timestamp()`);
