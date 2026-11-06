@@ -1,5 +1,5 @@
-require('newrelic');
 require('dotenv').config();
+require('newrelic');
 const express = require('express');
 const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
@@ -9,6 +9,8 @@ const negotiations = require('./negotiations');
 const market = require('./market');
 const seller = require('./seller');
 const reconciliation = require('./reconciliation');
+const admin = require('./admin');
+const cycles = require('./cycles');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
@@ -36,7 +38,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -517,27 +519,62 @@ app.get('/cycles', authenticate, async (req, res) => {
 
 app.get('/cycles/:cycleId', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT cycle_id AS "cycleId",
-              COUNT(*)::int AS "operationCount",
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'status-statement'), '[]') AS "statusStatements",
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'transfer'), '[]') AS transfers,
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'demand-statement'), '[]') AS "demandStatements",
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type IN ('negotiation-proposal', 'give', 'take', 'transfer')), '[]') AS negotiations,
-              COALESCE(JSONB_AGG(package_body ORDER BY seq) FILTER (WHERE type = 'negotiation-report'), '[]') AS "negotiationReports",
-              (ARRAY_AGG(package_body ORDER BY seq DESC) FILTER (WHERE type = 'negotiation-report'))[1] AS "finalBalances",
-              (ARRAY_AGG(type ORDER BY seq DESC))[1] AS "lastOperationType",
-              (ARRAY_AGG(received_at ORDER BY seq DESC))[1] AS "lastOperationAt"
-       FROM events
-       WHERE cycle_id = $1
-       GROUP BY cycle_id`,
-      [req.params.cycleId]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ error: 'Ciclo no encontrado' });
-    return res.json(result.rows[0]);
+    const detail = await cycles.getCycleDetail(pool, req.params.cycleId);
+    if (!detail) return res.status(404).json({ error: 'Ciclo no encontrado' });
+    return res.json(detail);
   } catch (err) {
     console.error('[master] Error al consultar ciclo:', err.message);
     return res.status(500).json({ error: 'Error interno al consultar ciclo' });
+  }
+});
+
+app.get('/market/live', authenticate, async (req, res) => {
+  try {
+    const live = await market.getLiveMarket(pool);
+    return res.json(live);
+  } catch (err) {
+    console.error('[master] Error al consultar /market/live:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar mercado en vivo' });
+  }
+});
+
+app.get('/admin/config', authenticate, async (req, res) => {
+  try {
+    const config = await admin.getStrategyConfig(pool);
+    return res.json(config);
+  } catch (err) {
+    console.error('[master] Error al consultar /admin/config:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar configuracion' });
+  }
+});
+
+app.put('/admin/config', authenticate, async (req, res) => {
+  try {
+    const updated = await admin.updateStrategyConfig(pool, req.body || {});
+    return res.json(updated);
+  } catch (err) {
+    console.error('[master] Error al actualizar /admin/config:', err.message);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/admin/swaps', authenticate, async (req, res) => {
+  try {
+    const swaps = await admin.getActiveSwaps(pool);
+    return res.json(swaps);
+  } catch (err) {
+    console.error('[master] Error al consultar /admin/swaps:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar swaps' });
+  }
+});
+
+app.get('/experiment/span', authenticate, async (req, res) => {
+  try {
+    const experiment = await admin.getSpanExperimentData(pool);
+    return res.json(experiment);
+  } catch (err) {
+    console.error('[master] Error al consultar /experiment/span:', err.message);
+    return res.status(500).json({ error: 'Error interno al consultar experimento de span' });
   }
 });
 

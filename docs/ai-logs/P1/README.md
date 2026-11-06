@@ -15,6 +15,7 @@
 | [04 · Vendedor simple y publicador de mercado](2026-10-24-p1-04-vendedor-simple-publicador-mercado.md) | Publicación de ofertas competitivas frente a MET, emisión de `offer-updated`/`offer-withdrawn`, respuestas `bid-rejected` con `available` y suite de 8 pruebas integradas. |
 | [05 · Registro de duplicados y NACK por IDENTITY_MISMATCH](2026-10-24-p1-05-registro-duplicados-y-nack-rf05.md) | Auditoría en `rejected_messages` de bids duplicados (`DUPLICATE_IDPK`), rechazo y sobre NACK 403 por `IDENTITY_MISMATCH`, e invarianza matemática del ledger (RF05). |
 | [06 · Robustez de AD5 y Conciliación con la Wallet](2026-11-05-p1-06-robustez-ad5-reconciliacion-wallet.md) | Conciliación automática al cierre (`GET /balance`), absorción de `/statement`, recuperación reactiva de timeouts (Anomalía 4) e invarianza contable (AD5). |
+| [07 · Conexión de Vistas RF01, RF02, RF04 y RF06 a la API Real](2026-11-06-p1-07-vistas-rf01-rf02-rf04-rf06-api.md) | Endpoints enriquecidos (`/cycles/:id`, `/market/live`, `/admin/config`, `/admin/swaps`, `/experiment/span`) y pantallas de React conectadas (RF01, RF02, RF04, RF06). |
 
 ## Criterios de edición
 
