@@ -9,15 +9,34 @@ const cycles = require('../cycles');
 
 const TEST_DB = process.env.TEST_DATABASE_URL || 'postgres://localhost:5432/energyshark_test';
 let pool;
+let adminClient;
+let schema;
 
 describe('views_api: soporte backend para RF01, RF02, RF04 y RF06', () => {
   before(async () => {
-    pool = new Pool({ connectionString: TEST_DB });
+    schema = 'views_test_' + randomUUID().replaceAll('-', '');
+    adminClient = new Pool({ connectionString: TEST_DB });
+    await adminClient.query(`CREATE SCHEMA ${schema}`);
+    pool = new Pool({ connectionString: TEST_DB, options: `-c search_path=${schema}` });
+    await pool.query(`CREATE TABLE events (
+      id UUID PRIMARY KEY,
+      idpk TEXT UNIQUE NOT NULL,
+      msg_id UUID,
+      type TEXT NOT NULL,
+      cycle_id TEXT,
+      package_body JSONB,
+      received_at TIMESTAMPTZ NOT NULL,
+      seq BIGSERIAL
+    );`);
     await ledger.migrate(pool);
   });
 
   after(async () => {
     if (pool) await pool.end();
+    if (adminClient) {
+      await adminClient.query(`DROP SCHEMA ${schema} CASCADE`);
+      await adminClient.end();
+    }
   });
 
   test('RF04 / AD6: lectura y actualizacion de configuracion de estrategia sin reinicio', async () => {
