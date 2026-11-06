@@ -1,5 +1,5 @@
 const finite = (x) => typeof x === 'number' && Number.isFinite(x);
-const { rankOffers } = require('./selection')
+const { rankOffers } = require('./selection');
 
 function fail(message) {
   const error = new Error(message);
@@ -141,9 +141,76 @@ async function getEffectiveOffers(db, cycleId, options = {}) {
   return rankOffers(offers, table, options);
 }
 
+async function getLiveMarket(pool) {
+  // 1. Obtener última distance-table registrada
+  const dtRes = await pool.query(
+    `SELECT package_body AS data, received_at AS "receivedAt"
+     FROM events
+     WHERE type = 'distance-table'
+     ORDER BY seq DESC
+     LIMIT 1`
+  );
+  const dtData = dtRes.rows[0]?.data || {};
+  const distances = dtData.distances || {};
+  const baseTransportRate = Number(dtData.transportCost || 0.05);
+  const disabledTransportRate = Number(dtData.disabledRouteTransportCost || 0.50);
+
+  // 2. Obtener todas las ofertas activas vigentes
+  const offersRes = await pool.query(
+    `SELECT offer_id AS "offerId",
+            cycle_id AS "cycleId",
+            city_id AS "cityId",
+            quantity,
+            remaining,
+            price_per_energy AS "pricePerEnergy",
+            status,
+            last_message_ts AS "lastMessageTs",
+            updated_at AS "updatedAt"
+     FROM market_offers
+     WHERE status = 'active' AND COALESCE(remaining, quantity, 0) > 0
+     ORDER BY price_per_energy ASC, remaining DESC`
+  );
+
+  const offers = offersRes.rows.map((row) => {
+    const cityId = row.cityId;
+    const distEntry = distances[cityId] || {};
+    const distanceKm = Number(distEntry.distance_km ?? distEntry.distance ?? (typeof distEntry === 'number' ? distEntry : 0));
+    const isRouteDisabled = distEntry.enabled === false;
+    const ratePerKm = isRouteDisabled ? disabledTransportRate : baseTransportRate;
+    const transportPerKwh = Math.round(distanceKm * ratePerKm * 100) / 100;
+    const price = Number(row.pricePerEnergy || 0);
+    const effectivePrice = Math.round((price + transportPerKwh) * 100) / 100;
+
+    return {
+      offerId: row.offerId,
+      cycleId: row.cycleId,
+      cityId: row.cityId,
+      quantity: Number(row.quantity),
+      remaining: Number(row.remaining),
+      pricePerEnergy: price,
+      distanceKm,
+      isRouteDisabled,
+      transportPerKwh,
+      effectivePricePerEnergy: effectivePrice,
+      status: row.status,
+      updatedAt: row.updatedAt,
+    };
+  });
+
+  return {
+    offers,
+    distanceTableMeta: {
+      receivedAt: dtRes.rows[0]?.receivedAt || null,
+      baseTransportRate,
+      disabledTransportRate,
+    },
+  };
+}
+
 module.exports = {
   recordMarketMessage,
   getActiveOffers,
   getEffectiveOffers,
   getLatestDistanceTable,
+  getLiveMarket,
 };
