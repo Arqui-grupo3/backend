@@ -11,8 +11,14 @@ env:
   ECR_REGISTRY: 088674918891.dkr.ecr.us-east-2.amazonaws.com
 
 jobs:
+  # Las mismas pruebas de cada PR: si fallan, no se construye ni se despliega nada.
+  tests:
+    name: Pruebas
+    uses: ./.github/workflows/ci.yml
+
   build-and-push:
     name: Construir y publicar imágenes en ECR
+    needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

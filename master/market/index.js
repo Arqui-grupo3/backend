@@ -1,4 +1,5 @@
 const finite = (x) => typeof x === 'number' && Number.isFinite(x);
+const { rankOffers } = require('./selection')
 
 function fail(message) {
   const error = new Error(message);
@@ -116,4 +117,33 @@ async function getActiveOffers(db, cycleId) {
   return rows;
 }
 
-module.exports = { recordMarketMessage, getActiveOffers };
+async function getLatestDistanceTable(db, asOf = null) {
+  const { rows } = await db.query(
+    `SELECT id, idpk, type, cycle_id AS "cycleId",
+            package_body AS data, received_at AS "receivedAt",
+            published_at AS "publishedAt"
+     FROM events
+     WHERE type='distance-table'
+       AND published_at IS NOT NULL
+       AND jsonb_typeof(package_body->'distances')='object'
+       AND ($1::timestamptz IS NULL OR published_at <= $1)
+     ORDER BY published_at DESC, seq DESC
+     LIMIT 1`,
+    [asOf]
+  );
+  return rows[0] ?? null;
+}
+
+async function getEffectiveOffers(db, cycleId, options = {}) {
+  const offers = await getActiveOffers(db, cycleId);
+  const table = options.distanceTable ?? (await getLatestDistanceTable(db))?.data;
+  if (!table) return [];
+  return rankOffers(offers, table, options);
+}
+
+module.exports = {
+  recordMarketMessage,
+  getActiveOffers,
+  getEffectiveOffers,
+  getLatestDistanceTable,
+};

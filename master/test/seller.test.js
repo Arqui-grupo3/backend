@@ -55,6 +55,9 @@ async function fixture(t) {
   });
   await pool.query(readFileSync(join(__dirname, '../migrations/008-seller.sql'), 'utf8'));
   await pool.query(REJECTED_MESSAGES_DDL);
+  await pool.query(readFileSync(join(__dirname, '../migrations/009-seller-market-rules.sql'), 'utf8'));
+  await pool.query(readFileSync(join(__dirname, '../migrations/010-strategy-config.sql'), 'utf8'));
+  await pool.query(readFileSync(join(__dirname, '../migrations/013-seller-price-decay.sql'), 'utf8'));
   return pool;
 }
 
