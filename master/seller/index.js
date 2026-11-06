@@ -520,6 +520,23 @@ async function processIncomingBid(pool, bidEvent, { walletClient, expiresAtOffse
 }
 
 /**
+ * Transiciona el bid a 'proposed' y vincula swap_id cuando la wallet notifica swap-proposed.
+ * Resuelve la Anomalía 4 de la demo (escrituras que sufrieron timeout pero sí fueron creadas).
+ */
+async function handleSwapProposed(pool, { swapIdpk, swapId }) {
+  if (!swapIdpk && !swapId) fail('swapIdpk o swapId requerido');
+  const res = await pool.query(
+    `UPDATE seller_bids
+     SET status = 'proposed', swap_id = COALESCE($1, swap_id), updated_at = now()
+     WHERE (swap_idpk = $2 OR ($1::text IS NOT NULL AND swap_id = $1))
+       AND status = 'reserved'
+     RETURNING idpk, offer_id AS "offerId", requested_quantity AS "requestedQuantity", status, swap_id AS "swapId"`,
+    [swapId || null, swapIdpk || null]
+  );
+  return res.rows[0] || null;
+}
+
+/**
  * Transiciona el bid a 'settled' cuando la wallet notifica swap-settled.
  */
 async function handleSwapSettled(pool, { swapIdpk, swapId }) {
@@ -555,6 +572,7 @@ module.exports = {
   createSellerOffer,
   getSellerOffer,
   processIncomingBid,
+  handleSwapProposed,
   handleSwapSettled,
   handleSwapReleased,
   calculateSellerPrice,

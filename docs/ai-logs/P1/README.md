@@ -14,6 +14,7 @@
 | [03 · Estado de la oferta y lock por offerId](2026-10-24-p1-03-estado-oferta-y-lock-bids.md) | Máquina de estados de venta, tablas `seller_offers` y `seller_bids`, serialización transaccional con `pg_advisory_xact_lock`, deduplicación RF05 y suite de 5 pruebas unitarias/integración. |
 | [04 · Vendedor simple y publicador de mercado](2026-10-24-p1-04-vendedor-simple-publicador-mercado.md) | Publicación de ofertas competitivas frente a MET, emisión de `offer-updated`/`offer-withdrawn`, respuestas `bid-rejected` con `available` y suite de 8 pruebas integradas. |
 | [05 · Registro de duplicados y NACK por IDENTITY_MISMATCH](2026-10-24-p1-05-registro-duplicados-y-nack-rf05.md) | Auditoría en `rejected_messages` de bids duplicados (`DUPLICATE_IDPK`), rechazo y sobre NACK 403 por `IDENTITY_MISMATCH`, e invarianza matemática del ledger (RF05). |
+| [06 · Robustez de AD5 y Conciliación con la Wallet](2026-11-05-p1-06-robustez-ad5-reconciliacion-wallet.md) | Conciliación automática al cierre (`GET /balance`), absorción de `/statement`, recuperación reactiva de timeouts (Anomalía 4) e invarianza contable (AD5). |
 
 ## Criterios de edición
 
@@ -23,11 +24,13 @@ No se compartieron credenciales con el asistente. Las pruebas se ejecutaron cont
 
 ## Estado que respaldan estos registros
 
-Los documentos y código respaldan la Fase 0, Fase 1 y requerimiento RF05 completos del Roadmap para P1:
+Los documentos y código respaldan la Fase 0, Fase 1, RF05 y AD5 completos del Roadmap para P1:
 - El estado de la oferta y el bloqueo consultivo transaccional por `offerId` garantizan matemáticamente cero sobreventas y cero `INSUFFICIENT_ASSET`.
 - Idempotencia nativa ante reintentos de bids (RF05) con registro formal en auditoría (`rejected_messages` con `DUPLICATE_IDPK`).
 - Validación estricta de identidad contra suplantación (`IDENTITY_MISMATCH`), despacho de sobre NACK 403 y registro en auditoría.
 - Restitución automática de saldo vendible ante expiración de swaps (Anomalía 3).
 - Publicación de ofertas competitivas frente a MET con cota inferior de no pérdida.
 - Notificación formal de rechazos (`bid-rejected`) con `available` y actualización reactiva de la pizarra (`offer-updated` / `offer-withdrawn`).
-- 11 de 11 pruebas automatizadas aprobadas en seller (19 pruebas en conjunto con ledger/effects).
+- Recuperación reactiva de escrituras con timeout procesadas por la wallet (Anomalía 4).
+- Conciliación automática con `GET /balance` y absorción determinista de `/statement` con snapshots en `cycle_reconciliations` (AD5).
+- 40 de 40 pruebas automatizadas aprobadas en suites de backend (`reconciliation`, `seller`, `effects`, `wallet`).

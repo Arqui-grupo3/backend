@@ -8,6 +8,7 @@ const {
   createSellerOffer,
   getSellerOffer,
   processIncomingBid,
+  handleSwapProposed,
   handleSwapSettled,
   handleSwapReleased,
   calculateSellerPrice,
@@ -512,6 +513,79 @@ test('seller: sobres NACK y helper cityFromUserId', async () => {
   assert.equal(sent[0].code, 403);
   assert.equal(sent[0].data.target, 'msg-test-123');
   assert.equal(sent[0].data.message, 'user_id no corresponde');
+});
+
+test('seller: recuperación de propuesta tras timeout en llamada a wallet mediante swap-proposed (Anomalía 4)', { skip: !hasDb }, async (t) => {
+  const pool = await fixture(t);
+  const offerId = 'REE-oferta-timeout-recovery';
+
+  await createSellerOffer(pool, {
+    offerId,
+    cycleId: 'cycle-timeout-recovery',
+    totalQuantity: 50,
+    pricePerEnergy: 260
+  });
+
+  const bid = {
+    msgId: randomUUID(),
+    idpk: randomUUID(),
+    cycleId: 'cycle-timeout-recovery',
+    cityId: 'VAL',
+    userId: 'city.VAL',
+    data: { offerId, quantity: 20, pricePerEnergy: 260 }
+  };
+
+  // Simular llamada a proposeSwap que sufre timeout de red
+  const mockFailingWallet = {
+    proposeSwap: async () => {
+      throw new Error('TimeoutError: operation timed out');
+    }
+  };
+
+  const decision = await processIncomingBid(pool, bid, {
+    walletClient: mockFailingWallet,
+    connectorUrl: null
+  });
+
+  // 1. La decisión fue aceptada y reservada, pero swapId es null por el timeout
+  assert.equal(decision.accepted, true);
+  assert.equal(decision.status, undefined); // No pasó a proposed en esa llamada
+  assert.ok(decision.swapIdpk);
+
+  const reservedBid = await pool.query('SELECT status, swap_id FROM seller_bids WHERE idpk = $1', [bid.idpk]);
+  assert.equal(reservedBid.rows[0].status, 'reserved');
+  assert.equal(reservedBid.rows[0].swap_id, null);
+
+  // 2. Posteriormente llega el evento swap-proposed de la central vía RabbitMQ
+  // confirmando que la wallet sí creó el swap ('swp-recovered-77')
+  const recovered = await handleSwapProposed(pool, {
+    swapId: 'swp-recovered-77',
+    swapIdpk: decision.swapIdpk
+  });
+
+  assert.ok(recovered);
+  assert.equal(recovered.status, 'proposed');
+  assert.equal(recovered.swapId, 'swp-recovered-77');
+
+  const proposedBid = await pool.query('SELECT status, swap_id FROM seller_bids WHERE idpk = $1', [bid.idpk]);
+  assert.equal(proposedBid.rows[0].status, 'proposed');
+  assert.equal(proposedBid.rows[0].swap_id, 'swp-recovered-77');
+
+  // 3. Finalmente llega swap-settled (que trae el swapId pero no nuestro idpk)
+  const settled = await handleSwapSettled(pool, {
+    swapId: 'swp-recovered-77',
+    swapIdpk: randomUUID() // idpk del accept del comprador
+  });
+
+  assert.ok(settled);
+  assert.equal(settled.status, 'settled');
+
+  const settledBid = await pool.query('SELECT status FROM seller_bids WHERE idpk = $1', [bid.idpk]);
+  assert.equal(settledBid.rows[0].status, 'settled');
+
+  // Stock remanente se mantiene en 30 kWh (50 - 20)
+  const finalState = await getSellerOffer(pool, offerId);
+  assert.equal(finalState.available, 30);
 });
 
 

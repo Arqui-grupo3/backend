@@ -8,6 +8,7 @@ const reports = require('./reports');
 const negotiations = require('./negotiations');
 const market = require('./market');
 const seller = require('./seller');
+const reconciliation = require('./reconciliation');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED === 'true';
@@ -301,12 +302,22 @@ app.post('/events', async (req, res) => {
       }
     }
 
-    if (type === 'swap-settled') {
+    if (type === 'swap-proposed') {
+      const swapId = body.data?.swapId;
+      const swapIdpk = body.data?.idpk || idpk;
+      await seller.handleSwapProposed(pool, { swapId, swapIdpk }).catch((e) => console.error('[seller] swap-proposed handler error:', e.message));
+    } else if (type === 'swap-settled') {
       const swapId = body.data?.swapId;
       await seller.handleSwapSettled(pool, { swapId, swapIdpk: idpk }).catch((e) => console.error('[seller] swap-settled handler error:', e.message));
     } else if (type === 'swap-expired' || type === 'swap-rejected' || type === 'swap-cancelled') {
       const swapId = body.data?.swapId;
       await seller.handleSwapReleased(pool, { swapId, swapIdpk: idpk, reason: type }).catch((e) => console.error('[seller] swap-released handler error:', e.message));
+    } else if (type === 'imbalance-settlement') {
+      const cycleId = body.cycleId;
+      if (cycleId) {
+        reconciliation.reconcileCycle({ pool, walletClient: wallet, cycleId })
+          .catch((e) => console.error('[reconciliation] Error en auto-conciliación al cierre:', e.message));
+      }
     }
 
     console.log(`[master] Evento almacenado. id=${result.id} idpk=${idpk}`);
@@ -460,6 +471,17 @@ app.get('/cycles/:cycleId/ledger', authenticate, async (req, res) => {
   } catch (err) {
     console.error('[master] Error al consultar ledger:', err.message);
     res.status(500).json({ error: 'Error al consultar ledger' });
+  }
+});
+
+app.get('/cycles/:cycleId/reconciliation', authenticate, async (req, res) => {
+  try {
+    const rec = await reconciliation.getReconciliation(pool, req.params.cycleId);
+    if (!rec) return res.status(404).json({ error: 'Ciclo sin conciliacion registrada' });
+    res.json(rec);
+  } catch (err) {
+    console.error('[master] Error al consultar conciliacion:', err.message);
+    res.status(500).json({ error: 'Error al consultar conciliacion' });
   }
 });
 
