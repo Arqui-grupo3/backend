@@ -7,18 +7,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY index.js ./
-COPY ledger/ ./ledger/
-COPY reports/ ./reports/
-COPY negotiations/ ./negotiations/
-COPY migrations/ ./migrations/
-COPY wallet/ ./wallet/
-COPY market/ ./market/
-COPY effects/ ./effects/
-COPY seller/ ./seller/
-COPY buyer/ ./buyer/
-COPY config/ ./config/
-COPY experiment/ ./experiment/
+COPY . .
 
 ENV PORT=3000
 EXPOSE 3000
