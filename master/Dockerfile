@@ -18,6 +18,7 @@ COPY effects/ ./effects/
 COPY seller/ ./seller/
 COPY buyer/ ./buyer/
 COPY config/ ./config/
+COPY experiment/ ./experiment/
 
 ENV PORT=3000
 EXPOSE 3000
