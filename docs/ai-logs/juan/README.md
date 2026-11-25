@@ -31,3 +31,28 @@ Se conservaron las propuestas rechazadas y los errores de diagnóstico relevante
 La conversación confirmó una solicitud válida al broker y una respuesta ACK más distance-table. También confirmó la descarga y construcción del commit de adaptación Client. Al último mensaje operativo todavía faltaban la comprobación del nuevo almacenamiento en EC2 y la prueba real de NACK.
 
 Los archivos describen esta conversación histórica, no el estado actual de todo el repositorio ni trabajos de otros integrantes o chats. Deben acompañar el resto de artefactos de proceso del equipo; no sustituyen sus ADR, contratos, spec o revisión de PR.
+
+---
+
+# AI logs — P2 — Entrega 2
+
+- Integrante: P2, ciudad REE, grupo 3.
+- Asistente: Claude Code (Claude Opus 5.5).
+- Periodo documentado: 5–6 de noviembre de 2026, America/Santiago.
+- Conversación: «Trabajo de Arquitectura de Sistemas de Software (E2)».
+- Alcance: diagnóstico del comprador y de la caída del nodo, informe de span (RDOC05), endpoint y vista de RF06, revisión de las anomalías 3 y 5 de la demo y el deploy fallido del 6-11.
+
+## Índice
+
+| Registro | Contenido |
+| --- | --- |
+| [06 · Diagnóstico del comprador y caída](2026-11-05-06-p2-06-diagnostico-comprador-y-caida.md) | Cobertura 0 % por línea de crédito, hipótesis descartadas y causa de la caída del 27-10 al 05-11. |
+| [07 · Informe de span y post-mortem](2026-11-05-06-p2-07-informe-span-y-postmortem.md) | RDOC05 con datos de producción, contrafactual del libro, New Relic y post-mortem del incidente. |
+| [08 · Endpoint y vista RF06](2026-11-05-06-p2-08-endpoint-y-vista-rf06.md) | `GET /experiment/span`, vista del frontend y errores corregidos en el camino. |
+| [09 · Anomalías y deploy fallido](2026-11-06-p2-09-anomalias-y-deploy-fallido.md) | Anomalías 3 y 5, corrección del comprador (#53) y módulos faltantes en la imagen del master. |
+
+## Criterios de edición
+
+Se priorizaron los pedidos de diagnóstico y corrección de errores. Se omitieron los mensajes muy generales o de continuación, como el pedido inicial de ayuda con el trabajo, el envío de los enunciados como contexto, «Soy el P2 en el roadmap», «Que mas podemos hacer mientras», «Leerlo con Chrome», «Primero pego Notion» y las confirmaciones del tipo «Sí, te la paso». El trabajo asociado a ellos queda descrito en los registros.
+
+Las salidas de terminal pegadas por el usuario se resumen. El nombre del host de la EC2 se reemplazó por `<host-ec2>`. Se conservaron las hipótesis equivocadas y los errores de la IA, porque muestran el proceso real de diagnóstico y la revisión humana.

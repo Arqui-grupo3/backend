@@ -2,11 +2,28 @@ const { getLocalBalance } = require('../effects');
 
 const round2 = (x) => Math.round(Number(x) * 100) / 100;
 
+let newrelic = null;
+try { newrelic = require('newrelic'); } catch { newrelic = null; }
+
+// Evento Reconciliation en New Relic, uno por ciclo conciliado. Es la fuente de la
+// alerta "Ledger desviado" (status = 'unexplained_delta'). Sin agente cargado
+// (local, pruebas) no hace nada. Nunca interrumpe la conciliación.
+function recordReconciliation(attrs) {
+  if (!newrelic || typeof newrelic.recordCustomEvent !== 'function') return;
+  try {
+    // New Relic solo acepta texto, números y booleanos: se omiten los valores vacíos.
+    const clean = Object.fromEntries(Object.entries(attrs).filter(([, v]) => v !== null && v !== undefined));
+    newrelic.recordCustomEvent('Reconciliation', clean);
+  } catch (err) {
+    console.warn('[reconciliation] No se pudo registrar el evento en New Relic:', err.message);
+  }
+}
+
 /**
  * Concilia el balance local acumulado en wallet_effects frente a la API de la wallet al cierre del ciclo.
  * Cumple con AD5: "Al cierre de cada ciclo, el saldo del dashboard coincide con GET /balance o el delta queda explicado".
  */
-async function reconcileCycle({ pool, walletClient, cycleId }) {
+async function reconcileCycle({ pool, walletClient, cycleId, recordEvent = recordReconciliation }) {
   if (!pool) throw new Error('reconcileCycle requiere pool');
   if (!cycleId) throw new Error('reconcileCycle requiere cycleId');
 
@@ -49,6 +66,10 @@ async function reconcileCycle({ pool, walletClient, cycleId }) {
        RETURNING *`,
       [cycleId, localCr, `Error consultando wallet: ${err.message}`]
     );
+    recordEvent({
+      cycleId, status: 'unexplained_delta', localCr, walletCr: null, deltaCr: null,
+      absorbedEntries: 0, walletError: true, reason: String(err.message).slice(0, 200)
+    });
     return res.rows[0];
   }
 
@@ -59,6 +80,8 @@ async function reconcileCycle({ pool, walletClient, cycleId }) {
   let status = 'matched';
   let explanation = 'Saldo local coincide con el saldo de la wallet';
   let absorbedEntries = [];
+  let walletError = false;
+  let finalLocalCr = localCr;
 
   // 4. Si hay delta, consultar GET /statement para absorber asientos faltantes (como adjustment)
   if (Math.abs(deltaCr) >= 0.01 && typeof walletClient.getStatement === 'function') {
@@ -110,6 +133,7 @@ async function reconcileCycle({ pool, walletClient, cycleId }) {
       // Recalcular saldo local tras absorber los asientos
       const updatedBalance = await getLocalBalance(pool);
       const updatedLocalCr = round2(updatedBalance.CR || 0);
+      finalLocalCr = updatedLocalCr;
       deltaCr = round2(walletCr - updatedLocalCr);
 
       if (Math.abs(deltaCr) < 0.01) {
@@ -122,6 +146,7 @@ async function reconcileCycle({ pool, walletClient, cycleId }) {
     } catch (stmtErr) {
       console.error(`[reconciliation] Error al consultar /statement para ciclo ${cycleId}:`, stmtErr.message);
       status = 'unexplained_delta';
+      walletError = true;
       explanation = `Delta de ${deltaCr} CR no resuelto: fallo al consultar /statement (${stmtErr.message})`;
     }
   }
@@ -141,8 +166,13 @@ async function reconcileCycle({ pool, walletClient, cycleId }) {
      RETURNING cycle_id AS "cycleId", local_cr::text AS "localCr", wallet_cr::text AS "walletCr",
                delta_cr::text AS "deltaCr", status, explanation, statement_entries AS "statementEntries",
                reconciled_at AS "reconciledAt"`,
-    [cycleId, localCr, walletCr, deltaCr, status, explanation, JSON.stringify(absorbedEntries)]
+    [cycleId, finalLocalCr, walletCr, deltaCr, status, explanation, JSON.stringify(absorbedEntries)]
   );
+
+  recordEvent({
+    cycleId, status, localCr: finalLocalCr, walletCr, deltaCr,
+    absorbedEntries: absorbedEntries.length, walletError
+  });
 
   console.log(`[reconciliation] Ciclo ${cycleId} conciliado: status=${status} delta=${deltaCr} CR`);
   return res.rows[0];

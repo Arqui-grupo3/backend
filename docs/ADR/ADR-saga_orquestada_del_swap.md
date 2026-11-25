@@ -1,6 +1,6 @@
 # ADR 0007 — Saga orquestada del swap (AD7)
 
-**Estado:** propuesto · 20 de noviembre de 2026 · responsable P1
+**Estado:** propuesto · 20 de noviembre de 2026
 
 ## Contexto
 

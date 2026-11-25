@@ -1,8 +1,9 @@
 require('dotenv').config();
+const telemetry = require('./telemetry');
 const fs = require('node:fs');
 const amqp = require('amqplib');
 const http = require('node:http');
-const { createPublisher } = require('./publisher');
+const { createPublisher, destinationFor } = require('./publisher');
 const { validateEnvelope, validateMarketMessage, cityFromUserId } = require('./validation');
 const RESPONSE_TYPES = new Set(['ack', 'nack', 'error', 'bid-rejected']);
 
@@ -107,10 +108,12 @@ async function discardMessage(channel, msg, entry) {
   try {
     await recordAudit({ category: 'DESCARTE', ...entry });
     channel.nack(msg, false, false);
+    return 'discard';
   } catch (err) {
     console.error('[connector] No se pudo registrar el descarte, se reencola:', err.message);
     await sleep(MASTER_RETRY_DELAY_MS);
     channel.nack(msg, false, true);
+    return 'requeue';
   }
 }
 
@@ -126,18 +129,23 @@ async function main() {
     });
   } catch (err) {
     console.error('[connector] Error al conectar:', err.message);
+    telemetry.recordBroker('connect-failed', err.message);
     console.log(`[connector] Reintentando en ${RECONNECT_DELAY_MS / 1000}s...`);
     setTimeout(main, RECONNECT_DELAY_MS);
     return;
   }
 
+  telemetry.recordBroker('connected');
+
   connection.on('error', (err) => {
     setConsuming(false);
+    telemetry.recordBroker('error', err.message);
     console.error('[connector] Error de conexión:', err.message);
   });
 
   connection.on('close', () => {
     setConsuming(false);
+    telemetry.recordBroker('closed');
     console.warn('[connector] Conexión cerrada. Reintentando en ' + RECONNECT_DELAY_MS / 1000 + 's...');
     setTimeout(main, RECONNECT_DELAY_MS);
   });
@@ -152,7 +160,24 @@ async function main() {
     console.warn('[connector] Canal cerrado.');
   });
   await channel.prefetch(1);
-  const publishMessage = await createPublisher(connection);
+  const rawPublish = await createPublisher(connection);
+
+  const publishMessage = async (body, routingKey) => {
+    const started = Date.now();
+    let exchange = 'desconocido';
+    let key = routingKey ?? null;
+    try {
+      ({ exchange, routingKey: key } = destinationFor(body?.type, routingKey));
+    } catch { /* lo rechaza rawPublish con su propio mensaje */ }
+    try {
+      const message = await rawPublish(body, routingKey);
+      telemetry.recordPublish({ exchange, routingKey: key, type: body?.type, outcome: 'ok', durationMs: Date.now() - started });
+      return message;
+    } catch (err) {
+      telemetry.recordPublish({ exchange, routingKey: key, type: body?.type, outcome: 'error', durationMs: Date.now() - started });
+      throw err;
+    }
+  };
 
   const controlServer = http.createServer(async (req, res) => {
     if (req.method !== 'POST' || req.url !== '/publish') {
@@ -187,7 +212,7 @@ async function main() {
 
   await channel.consume(
     RABBIT_QUEUE,
-    async (msg) => {
+    telemetry.consumer(RABBIT_QUEUE, async (msg, info) => {
       if (msg === null) return;
 
       const receivedAt = new Date().toISOString();
@@ -199,10 +224,10 @@ async function main() {
       if (!['city.REE', 'city.broadcast'].includes(routingKey)) {
         const detail = `Routing key inesperada: ${JSON.stringify(routingKey)}`;
         console.error(`[connector] ${detail}`);
-        await discardMessage(channel, msg, {
+        info.attrs.reason = 'UNEXPECTED_ROUTING_KEY';
+        return discardMessage(channel, msg, {
           reason: 'UNEXPECTED_ROUTING_KEY', detail, rawBody: raw, routingKey, receivedAt,
         });
-        return;
       }
       const delivery = routingKey === 'city.broadcast' ? 'broadcast' : 'direct';
 
@@ -211,41 +236,48 @@ async function main() {
         event = JSON.parse(raw);
       } catch (err) {
         console.error('[connector] No se pudo parsear el mensaje, se descarta:', err.message);
-        await discardMessage(channel, msg, {
+        info.attrs.reason = 'INVALID_JSON';
+        return discardMessage(channel, msg, {
           reason: 'INVALID_JSON', detail: err.message, rawBody: raw, routingKey, receivedAt,
         });
-        return;
       }
 
       if (event === null || typeof event !== "object" || Array.isArray(event)) {
         const detail = 'El mensaje no es un objeto JSON.';
         console.error(`[connector] ${detail}`);
-        await discardMessage(channel, msg, {
+        info.attrs.reason = 'INVALID_ENVELOPE';
+        return discardMessage(channel, msg, {
           reason: 'INVALID_ENVELOPE', detail, payload: event, rawBody: raw, routingKey, receivedAt,
         });
-        return;
       }
 
       if (!Object.hasOwn(event, "msgId")) {
         const detail = 'El mensaje no incluye msgId.';
         console.error(`[connector] ${detail}`);
-        await discardMessage(channel, msg, {
+        info.attrs.reason = 'MISSING_MSGID';
+        return discardMessage(channel, msg, {
           reason: 'MISSING_MSGID', detail, payload: event, rawBody: raw, routingKey, receivedAt,
         });
-        return;
       }
+
+      info.attrs = {
+        type: typeof event.type === 'string' ? event.type : null,
+        cityId: cityFromUserId(userId) || (typeof event.cityId === 'string' ? event.cityId : null),
+        cycleId: typeof event.cycleId === 'string' ? event.cycleId : null,
+        timestamp: event.timestamp,
+      };
 
       try {
         const invalid = validateEnvelope(event, { userId });
         const respondTo = replyRoutingKey(event, userId) ?? replyTo;
         if (invalid) {
+          info.attrs.reason = invalid.reason;
           console.error(`[connector] Mensaje rechazado: ${invalid.reason} msgId=${JSON.stringify(event.msgId)}: ${invalid.message}`);
           if (RESPONSE_TYPES.has(event.type)) {
-            await discardMessage(channel, msg, {
+            return discardMessage(channel, msg, {
               reason: 'INVALID_RESPONSE', detail: invalid.message, payload: event,
               rawBody: raw, routingKey, receivedAt,
             });
-            return;
           }
           const audit = await recordAudit({
             category: 'NACK', reason: invalid.reason, code: invalid.code,
@@ -254,7 +286,7 @@ async function main() {
           if (!respondTo) {
             console.warn(`[connector] NACK sin destinatario (user_id ${JSON.stringify(userId)}); solo se registra.`);
             channel.ack(msg);
-            return;
+            return 'nack';
           }
           const data = { target: event.msgId, message: invalid.message };
           if (typeof event.cycleId === 'string' && event.cycleId.length <= 64) data.cycleId = event.cycleId;
@@ -269,7 +301,7 @@ async function main() {
           });
           if (!response.ok) throw new Error(`master respondio ${response.status} al registrar publicacion NACK`);
           channel.ack(msg);
-          return;
+          return 'nack';
         }
 
         console.log(`[connector] Evento recibido idpk=${event.idpk} type=${event.type}`);
@@ -290,17 +322,25 @@ async function main() {
         }
 
         channel.ack(msg);
+        return 'ack';
       } catch (err) {
         console.error('[connector] No se pudo procesar el mensaje o publicar su respuesta, se reencola:', err.message);
+        info.attrs.reason = err.message.slice(0, 200);
 
         await sleep(MASTER_RETRY_DELAY_MS);
         channel.nack(msg, false, true);
+        return 'requeue';
       }
-    },
+    }),
     { noAck: false }
   );
 
   if (RABBIT_MARKET_QUEUE) await consumeMarket(connection);
+
+  const stopDepthPoller = telemetry.startQueueDepthPoller(
+    connection, [RABBIT_QUEUE, RABBIT_MARKET_QUEUE].filter(Boolean)
+  );
+  connection.on('close', stopDepthPoller);
 
   setConsuming(true);
   writeHeartbeat();
@@ -321,7 +361,7 @@ async function consumeMarket(connection) {
 
   await marketChannel.consume(
     RABBIT_MARKET_QUEUE,
-    async (msg) => {
+    telemetry.consumer(RABBIT_MARKET_QUEUE, async (msg, info) => {
       if (msg === null) return;
       const receivedAt = new Date().toISOString();
       const raw = msg.content.toString('utf8');
@@ -331,20 +371,29 @@ async function consumeMarket(connection) {
       try {
         event = JSON.parse(raw);
       } catch (err) {
-        await discardMessage(marketChannel, msg, {
+        info.attrs.reason = 'INVALID_JSON';
+        return discardMessage(marketChannel, msg, {
           reason: 'INVALID_JSON', detail: `Feed de mercado: ${err.message}`, rawBody: raw, routingKey, receivedAt,
         });
-        return;
+      }
+
+      if (event && typeof event === 'object') {
+        info.attrs = {
+          type: typeof event.type === 'string' ? event.type : null,
+          cityId: typeof event.cityId === 'string' ? event.cityId : null,
+          cycleId: typeof event.cycleId === 'string' ? event.cycleId : null,
+          timestamp: event.timestamp,
+        };
       }
 
       const invalid = validateMarketMessage(event, { routingKey });
       if (invalid) {
         console.error(`[connector] Mensaje de mercado descartado: ${invalid.reason}: ${invalid.message}`);
-        await discardMessage(marketChannel, msg, {
+        info.attrs.reason = invalid.reason;
+        return discardMessage(marketChannel, msg, {
           reason: 'INVALID_ENVELOPE', detail: `Feed de mercado (${invalid.reason}): ${invalid.message}`,
           payload: event, rawBody: raw, routingKey, receivedAt,
         });
-        return;
       }
 
       try {
@@ -356,17 +405,21 @@ async function consumeMarket(connection) {
         });
         if (response.status >= 400 && response.status < 500) {
           console.error(`[connector] master rechazó el mensaje de mercado (${response.status}); se descarta.`);
+          info.attrs.reason = `MASTER_${response.status}`;
           marketChannel.ack(msg);
-          return;
+          return 'rejected';
         }
         if (!response.ok) throw new Error(`master respondió ${response.status}`);
         marketChannel.ack(msg);
+        return 'ack';
       } catch (err) {
         console.error('[connector] No se pudo entregar el mensaje de mercado, se reencola:', err.message);
+        info.attrs.reason = err.message.slice(0, 200);
         await sleep(MASTER_RETRY_DELAY_MS);
         marketChannel.nack(msg, false, true);
+        return 'requeue';
       }
-    },
+    }),
     { noAck: false }
   );
 }

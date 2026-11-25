@@ -67,6 +67,9 @@ services:
       - ./connector/.env
     environment:
       MASTER_URL: http://master:3000/events
+      NEW_RELIC_LICENSE_KEY: ${NEW_RELIC_LICENSE_KEY}
+      NEW_RELIC_APP_NAME: energyshark-connector
+      NEW_RELIC_LOG: stdout
     depends_on:
       - master
     networks:
