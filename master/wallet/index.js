@@ -126,14 +126,42 @@ function createWalletClient({
     return Math.round(exp / 2 + Math.random() * (exp / 2));
   }
 
+  // Evento WalletCall más métricas Custom/Wallet/... para gráficos y alertas.
+  // status 0 = sin respuesta (timeout o error de red).
   function record(attrs) {
-    if (newrelic && typeof newrelic.recordCustomEvent === 'function') {
+    if (!newrelic) return;
+    try {
       newrelic.recordCustomEvent('WalletCall', attrs);
+      const op = attrs.operation || 'unknown';
+      newrelic.incrementMetric(`Custom/Wallet/${op}/Calls`);
+      newrelic.recordMetric(`Custom/Wallet/${op}/DurationMs`, attrs.durationMs);
+      newrelic.recordMetric('Custom/Wallet/All/DurationMs', attrs.durationMs);
+      const kind = attrs.status === 0 ? 'Timeout'
+        : attrs.status === 429 ? 'RateLimited'
+          : attrs.status >= 500 ? 'ServerError'
+            : attrs.status >= 400 ? 'ClientError' : 'Ok';
+      newrelic.incrementMetric(`Custom/Wallet/All/${kind}`);
+      newrelic.addCustomAttributes({ walletOperation: op, walletStatus: attrs.status, walletDurationMs: attrs.durationMs });
+    } catch (err) {
+      logger.warn?.('[wallet] No se pudo registrar la telemetría:', err.message);
     }
   }
 
+  // Cada llamada corre dentro de una transacción de New Relic (Wallet/<operación>).
+  // Dentro de una request HTTP queda como segmento de esa transacción; desde los
+  // workers (comprador, reintentos, conciliación) crea una transacción de
+  // background propia. Sin esto, las llamadas hechas fuera de una request no
+  // aparecerían en External services.
+  function send(method, path, opts = {}) {
+    const name = opts.operation || method.toLowerCase();
+    if (newrelic && typeof newrelic.startBackgroundTransaction === 'function') {
+      return newrelic.startBackgroundTransaction(name, 'Wallet', () => sendRaw(method, path, opts));
+    }
+    return sendRaw(method, path, opts);
+  }
+
   // Una llamada HTTP. Nunca lanza por errores de red: los devuelve como resultado.
-  async function send(method, path, { body, idpk, operation } = {}) {
+  async function sendRaw(method, path, { body, idpk, operation } = {}) {
     const headers = { 'X-Api-Key': apiKey, Accept: 'application/json' };
     if (idpk) headers['Idempotency-Key'] = idpk;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -351,10 +379,10 @@ function createWalletClient({
 
   // ---------- Lecturas ----------
 
-  async function read(path) {
+  async function read(path, operation = 'read') {
     let transientFailures = 0;
     while (true) {
-      const res = await send('GET', path);
+      const res = await send('GET', path, { operation });
       if (res.status >= 200 && res.status < 300) return res.body;
       if (res.status === 429) {
         await sleep(parseRetryAfter(res.retryAfter, now(), baseDelayMs, maxRetryAfterMs));
@@ -375,9 +403,9 @@ function createWalletClient({
     }
   }
 
-  const getSwap = (swapId) => read(`/swaps/${encodeURIComponent(swapId)}`);
-  const getBalance = () => read('/balance');
-  const getLeaderboard = () => read('/leaderboard');
+  const getSwap = (swapId) => read(`/swaps/${encodeURIComponent(swapId)}`, 'swap');
+  const getBalance = () => read('/balance', 'balance');
+  const getLeaderboard = () => read('/leaderboard', 'leaderboard');
   function getStatement({ cycleId, asset, cursor, limit } = {}) {
     const params = new URLSearchParams();
     if (cycleId) params.set('cycleId', cycleId);
@@ -385,7 +413,7 @@ function createWalletClient({
     if (cursor) params.set('cursor', cursor);
     if (limit) params.set('limit', String(limit));
     const query = params.toString();
-    return read(`/statement${query ? `?${query}` : ''}`);
+    return read(`/statement${query ? `?${query}` : ''}`, 'statement');
   }
 
   return {

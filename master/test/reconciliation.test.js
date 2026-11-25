@@ -141,3 +141,72 @@ test('reconciliation: tolerancia ante caída de la wallet', async (t) => {
   assert.equal(rec.status, 'unexplained_delta');
   assert.ok(rec.explanation.includes('Error consultando wallet'));
 });
+
+test('reconciliation: registra un evento Reconciliation por ciclo para New Relic', async (t) => {
+  const pool = await fixture(t);
+  const events = [];
+  const recordEvent = (e) => events.push(e);
+
+  // matched
+  await recordEventLedger(pool, 'cycle-ev-1', 1000);
+  await reconcileCycle({
+    pool, cycleId: 'cycle-ev-1', recordEvent,
+    walletClient: { getBalance: async () => ({ assets: { CR: { balance: 1000 } } }), getStatement: async () => [] }
+  });
+  assert.deepEqual(events.at(-1), {
+    cycleId: 'cycle-ev-1', status: 'matched', localCr: 1000, walletCr: 1000, deltaCr: 0,
+    absorbedEntries: 0, walletError: false
+  });
+
+  // adjusted: el saldo local del evento y de la fila es el posterior a absorber el /statement
+  const rec = await reconcileCycle({
+    pool, cycleId: 'cycle-ev-2', recordEvent,
+    walletClient: {
+      getBalance: async () => ({ assets: { CR: { balance: 900 } } }),
+      getStatement: async () => [{ id: 'stmt-ev-1', kind: 'adjustment', amount: -100, type: 'adjustment' }]
+    }
+  });
+  assert.equal(rec.status, 'adjusted');
+  assert.equal(rec.localCr, '900.00', 'local_cr guarda el saldo después de absorber el statement');
+  assert.deepEqual(events.at(-1), {
+    cycleId: 'cycle-ev-2', status: 'adjusted', localCr: 900, walletCr: 900, deltaCr: 0,
+    absorbedEntries: 1, walletError: false
+  });
+
+  // unexplained_delta
+  await reconcileCycle({
+    pool, cycleId: 'cycle-ev-3', recordEvent,
+    walletClient: { getBalance: async () => ({ assets: { CR: { balance: 700 } } }), getStatement: async () => [] }
+  });
+  assert.equal(events.at(-1).status, 'unexplained_delta');
+  assert.equal(events.at(-1).deltaCr, -200);
+  assert.equal(events.at(-1).walletError, false);
+
+  // la wallet no responde
+  await reconcileCycle({
+    pool, cycleId: 'cycle-ev-4', recordEvent,
+    walletClient: { getBalance: async () => { throw new Error('503 Service Unavailable'); } }
+  });
+  assert.equal(events.at(-1).status, 'unexplained_delta');
+  assert.equal(events.at(-1).walletError, true);
+  assert.equal(events.at(-1).walletCr, null);
+
+  // sin cliente de wallet (simulación) no se registra evento
+  const before = events.length;
+  await reconcileCycle({ pool, cycleId: 'cycle-ev-5', recordEvent, walletClient: null });
+  assert.equal(events.length, before);
+});
+
+test('reconciliation: sin agente de New Relic el registrador por defecto no hace nada', async (t) => {
+  const pool = await fixture(t);
+  await recordEventLedger(pool, 'cycle-ev-default', 50);
+  const rec = await reconcileCycle({
+    pool, cycleId: 'cycle-ev-default',
+    walletClient: { getBalance: async () => ({ assets: { CR: { balance: 50 } } }), getStatement: async () => [] }
+  });
+  assert.equal(rec.status, 'matched');
+});
+
+async function recordEventLedger(pool, cycleId, quantity) {
+  await recordEvent(pool, msg('transfer', { quantity }, { cycleId }));
+}
