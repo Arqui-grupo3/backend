@@ -3,10 +3,10 @@ import {
   callWallet,
   getSecretString,
   logEvent,
-  noopTaskTokenStore,
   round2,
   TaskTokenStore
 } from './shared';
+import { resolveDefaultTokenStore } from './token-store';
 import type { ReservarResult } from './reservar';
 
 export interface ProponerEvent {
@@ -40,7 +40,7 @@ function mapImmediateStatus(status: unknown): string {
 export function createProponerHandler(deps: ProponerDeps = {}) {
   return async function handler(event: ProponerEvent): Promise<{ waiting: boolean; immediate?: boolean }> {
     const { taskToken, executionName, input } = event;
-    const tokenStore = deps.tokenStore ?? noopTaskTokenStore;
+    const tokenStore = deps.tokenStore ?? resolveDefaultTokenStore();
     const getSecret = deps.getSecret ?? getSecretString;
     const walletBaseUrl = deps.walletBaseUrl ?? process.env.WALLET_BASE_URL ?? '';
     const walletApiKeyArn = deps.walletApiKeyArn ?? process.env.WALLET_API_KEY_ARN ?? '';
