@@ -1,5 +1,6 @@
 import { SendTaskSuccessCommand, SFNClient } from '@aws-sdk/client-sfn';
-import { logEvent, noopTaskTokenStore, TaskTokenStore } from './shared';
+import { logEvent, TaskTokenStore } from './shared';
+import { resolveDefaultTokenStore } from './token-store';
 
 export interface EsperarCierreEvent {
   taskToken: string;
@@ -22,7 +23,7 @@ let defaultSfnClient: SFNClient | null = null;
 export function createEsperarCierreHandler(deps: EsperarCierreDeps = {}) {
   return async function handler(event: EsperarCierreEvent): Promise<{ waiting: boolean; immediate?: boolean }> {
     const { taskToken, executionName, input } = event;
-    const tokenStore = deps.tokenStore ?? noopTaskTokenStore;
+    const tokenStore = deps.tokenStore ?? resolveDefaultTokenStore();
     const sfn = deps.sfnClient ?? (defaultSfnClient ??= new SFNClient({}));
 
     // ADR 0007: registrar el task token bajo swapId para swap-settled / swap-expired / swap-cancelled

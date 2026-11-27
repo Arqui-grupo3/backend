@@ -50,16 +50,36 @@ test('declara el secreto HMAC sin SecretString embebido y con Retention RETAIN',
   });
 });
 
-test('exporta los ARN de la maquina de estados y del secreto HMAC', () => {
+test('exporta los ARN de la maquina de estados, del secreto HMAC y de la tabla de task tokens', () => {
   template.hasOutput('SellerSagaStateMachineArn', {
     Export: { Name: 'EnergyShark-SellerSagaStateMachineArn' }
   });
   template.hasOutput('InternalHmacSecretArn', {
     Export: { Name: 'EnergyShark-InternalHmacSecretArn' }
   });
+  template.hasOutput('TaskTokensTableName', {
+    Export: { Name: 'EnergyShark-TaskTokensTableName' }
+  });
+  template.hasOutput('TaskTokensTableArn', {
+    Export: { Name: 'EnergyShark-TaskTokensTableArn' }
+  });
 });
 
-test('aplica permisos minimos: Avisar solo lee brokerUrl y no walletApiKey', () => {
+test('declara la tabla DynamoDB de task tokens en modo PAY_PER_REQUEST con TTL', () => {
+  template.resourceCountIs('AWS::DynamoDB::Table', 1);
+  template.hasResourceProperties('AWS::DynamoDB::Table', {
+    TableName: 'energyshark-saga-task-tokens',
+    BillingMode: 'PAY_PER_REQUEST',
+    KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' }],
+    AttributeDefinitions: [{ AttributeName: 'pk', AttributeType: 'S' }],
+    TimeToLiveSpecification: {
+      AttributeName: 'expiresAtEpoch',
+      Enabled: true
+    }
+  });
+});
+
+test('aplica permisos minimos: secretos y DynamoDB solo en las Lambdas correspondientes', () => {
   const policies = template.findResources('AWS::IAM::Policy');
   const entries = Object.entries(policies);
 
@@ -69,11 +89,28 @@ test('aplica permisos minimos: Avisar solo lee brokerUrl y no walletApiKey', () 
   expect(avisarPolicyText).toContain('secretsmanager:GetSecretValue');
   expect(avisarPolicyText).toContain('BrokerUrl');
   expect(avisarPolicyText).not.toContain('WalletApiKey');
+  expect(avisarPolicyText).not.toContain('dynamodb:');
 
   const proponerPolicy = entries.find(([logicalId]) => logicalId.includes('SellerProponerFn'));
   expect(proponerPolicy).toBeDefined();
   const proponerPolicyText = JSON.stringify(proponerPolicy![1]);
   expect(proponerPolicyText).toContain('WalletApiKey');
   expect(proponerPolicyText).toContain('states:SendTaskSuccess');
+  expect(proponerPolicyText).toContain('dynamodb:PutItem');
+  expect(proponerPolicyText).toContain('dynamodb:GetItem');
   expect(proponerPolicyText).not.toContain('BrokerUrl');
+
+  const esperarCierrePolicy = entries.find(([logicalId]) => logicalId.includes('SellerEsperarCierreFn'));
+  expect(esperarCierrePolicy).toBeDefined();
+  const esperarCierrePolicyText = JSON.stringify(esperarCierrePolicy![1]);
+  expect(esperarCierrePolicyText).toContain('dynamodb:PutItem');
+  expect(esperarCierrePolicyText).toContain('dynamodb:GetItem');
+  expect(esperarCierrePolicyText).not.toContain('secretsmanager:');
+
+  for (const fnName of ['SellerReservarFn', 'SellerReconciliarFn', 'SellerCancelarFn', 'SellerResultadoFn']) {
+    const policy = entries.find(([logicalId]) => logicalId.includes(fnName));
+    if (policy) {
+      expect(JSON.stringify(policy[1])).not.toContain('dynamodb:');
+    }
+  }
 });

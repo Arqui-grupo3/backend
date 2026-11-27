@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import { ArnFormat, CfnOutput, Duration, RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -20,6 +21,7 @@ const LAMBDAS_DIR = path.join(__dirname, '..', 'lambdas', 'seller');
 
 export class SagaStack extends Stack {
   readonly internalHmacSecret: secretsmanager.Secret;
+  readonly taskTokensTable: dynamodb.Table;
   readonly sellerStateMachine: sfn.StateMachine;
   readonly reservarFn: NodejsFunction;
   readonly proponerFn: NodejsFunction;
@@ -43,6 +45,15 @@ export class SagaStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN
     });
 
+    // Tabla DynamoDB de task tokens (ADR 0007 / tarea 1.2): PK prefijada idpk:<uuid> | swapId:<id>
+    this.taskTokensTable = new dynamodb.Table(this, 'TaskTokensTable', {
+      tableName: 'energyshark-saga-task-tokens',
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: 'expiresAtEpoch',
+      removalPolicy: RemovalPolicy.DESTROY
+    });
+
     const commonLambdaProps = {
       runtime: lambda.Runtime.NODEJS_22_X,
       architecture: lambda.Architecture.ARM_64,
@@ -62,17 +73,19 @@ export class SagaStack extends Stack {
       description: 'Valida la reserva local y calcula plazos dinamicos de la saga del vendedor'
     });
 
-    // 2. Proponer (lee walletApiKey; permiso SendTaskSuccess para HTTP 200 inmediato)
+    // 2. Proponer (lee walletApiKey; guarda taskToken en DynamoDB; SendTaskSuccess para HTTP 200)
     this.proponerFn = new NodejsFunction(this, 'SellerProponerFn', {
       ...commonLambdaProps,
       entry: path.join(LAMBDAS_DIR, 'proponer.ts'),
-      description: 'Guarda hook de taskToken y propone swap en la wallet con Idempotency-Key',
+      description: 'Guarda taskToken en DynamoDB y propone swap en la wallet con Idempotency-Key',
       environment: {
         WALLET_BASE_URL: walletBaseUrl,
-        WALLET_API_KEY_ARN: props.base.walletApiKey.secretArn
+        WALLET_API_KEY_ARN: props.base.walletApiKey.secretArn,
+        TASK_TOKENS_TABLE_NAME: this.taskTokensTable.tableName
       }
     });
     props.base.walletApiKey.grantRead(this.proponerFn);
+    this.taskTokensTable.grant(this.proponerFn, 'dynamodb:PutItem', 'dynamodb:GetItem');
 
     // 3. Avisar (lee brokerUrl unicamente)
     this.avisarFn = new NodejsFunction(this, 'SellerAvisarFn', {
@@ -86,12 +99,16 @@ export class SagaStack extends Stack {
     });
     props.base.brokerUrl.grantRead(this.avisarFn);
 
-    // 4. EsperarCierre (sin secretos en 1.1; en 1.2 recibira permisos de DynamoDB)
+    // 4. EsperarCierre (guarda taskToken en DynamoDB bajo swapId)
     this.esperarCierreFn = new NodejsFunction(this, 'SellerEsperarCierreFn', {
       ...commonLambdaProps,
       entry: path.join(LAMBDAS_DIR, 'esperar-cierre.ts'),
-      description: 'Registra hook de taskToken bajo swapId para esperar liquidacion o vencimiento'
+      description: 'Guarda taskToken en DynamoDB bajo swapId para esperar liquidacion o vencimiento',
+      environment: {
+        TASK_TOKENS_TABLE_NAME: this.taskTokensTable.tableName
+      }
     });
+    this.taskTokensTable.grant(this.esperarCierreFn, 'dynamodb:PutItem', 'dynamodb:GetItem');
 
     // 5. Reconciliar (lee walletApiKey unicamente)
     this.reconciliarFn = new NodejsFunction(this, 'SellerReconciliarFn', {
@@ -348,6 +365,16 @@ export class SagaStack extends Stack {
     new CfnOutput(this, 'InternalHmacSecretArn', {
       value: this.internalHmacSecret.secretArn,
       exportName: 'EnergyShark-InternalHmacSecretArn'
+    });
+
+    new CfnOutput(this, 'TaskTokensTableName', {
+      value: this.taskTokensTable.tableName,
+      exportName: 'EnergyShark-TaskTokensTableName'
+    });
+
+    new CfnOutput(this, 'TaskTokensTableArn', {
+      value: this.taskTokensTable.tableArn,
+      exportName: 'EnergyShark-TaskTokensTableArn'
     });
   }
 }
