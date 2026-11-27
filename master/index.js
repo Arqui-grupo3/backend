@@ -15,6 +15,7 @@ const experiment = require('./experiment');
 const reconciliation = require('./reconciliation');
 const admin = require('./admin');
 const cycles = require('./cycles');
+const sagas = require('./sagas');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
@@ -36,7 +37,12 @@ const MAX_PAGE_LIMIT = 100;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({
+  limit: '1mb',
+  verify: (req, _res, buf) => {
+    req.rawBody = buf.toString('utf8');
+  }
+}));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -815,6 +821,32 @@ app.get('/connectivity', authenticate, async (req, res) => {
   } catch (err) {
     console.error('[master] Error al consultar /connectivity:', err.message);
     res.status(500).json({ error: 'Error interno al consultar conectividad' });
+  }
+});
+
+app.post('/internal/sagas/:idpk/resultado', async (req, res) => {
+  const idpk = req.params.idpk;
+  const check = sagas.verifySagaHmac({
+    secret: process.env.INTERNAL_SAGA_HMAC_SECRET || '',
+    timestampHeader: req.get('x-saga-timestamp'),
+    signatureHeader: req.get('x-saga-signature'),
+    idpk,
+    rawBody: req.rawBody ?? JSON.stringify(req.body || {})
+  });
+  if (!check.ok) {
+    return res.status(401).json({ error: check.error });
+  }
+  try {
+    const result = await sagas.recordSagaResult(pool, {
+      idpk,
+      body: req.body || {},
+      connectorUrl: CONNECTOR_URL
+    });
+    res.status(200).json(result);
+  } catch (err) {
+    if (err.statusCode === 422) return res.status(422).json({ error: err.message });
+    console.error('[sagas] Error registrando resultado de saga:', err.message);
+    res.status(500).json({ error: 'Error interno al registrar resultado de saga' });
   }
 });
 
