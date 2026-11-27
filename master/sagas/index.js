@@ -4,6 +4,14 @@
  */
 const { createHmac, timingSafeEqual } = require('node:crypto');
 const seller = require('../seller');
+const {
+  createSagaResumer,
+  extractKeysForEvent,
+  buildResultPayload,
+  formatTokenPk,
+  WALLET_RESUME_EVENTS,
+  TASK_TOKEN_TTL_SECONDS
+} = require('./resume');
 
 const MAX_REPLAY_WINDOW_SEC = 300;
 const VALID_OUTCOMES = new Set(['settled', 'compensated', 'rejected']);
@@ -134,5 +142,11 @@ module.exports = {
   signSagaPayload,
   verifySagaHmac,
   recordSagaResult,
+  createSagaResumer,
+  extractKeysForEvent,
+  buildResultPayload,
+  formatTokenPk,
+  WALLET_RESUME_EVENTS,
+  TASK_TOKEN_TTL_SECONDS,
   MAX_REPLAY_WINDOW_SEC
 };

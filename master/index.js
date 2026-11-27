@@ -19,6 +19,10 @@ const sagas = require('./sagas');
 const { createWalletClient } = require('./wallet');
 
 const REPORTS_ENABLED = process.env.REPORTS_ENABLED !== 'false';
+const sagaResumer = sagas.createSagaResumer({
+  tableName: process.env.TASK_TOKENS_TABLE_NAME,
+  region: process.env.AWS_REGION
+});
 
 let wallet = null;
 let walletWorker;
@@ -354,6 +358,11 @@ app.post('/events', async (req, res) => {
           connectorUrl: CONNECTOR_URL
         }).catch((err) => console.error('[seller] Error publicando oferta tras status-statement:', err.message));
       }
+    }
+
+    if (sagas.WALLET_RESUME_EVENTS.has(type)) {
+      await sagaResumer.resumeFromWalletEvent(body)
+        .catch((e) => console.error('[sagas] Error reanudando saga desde evento wallet:', e.message));
     }
 
     if (type === 'swap-proposed') {

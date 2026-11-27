@@ -63,6 +63,28 @@ test('exporta los ARN de la maquina de estados, del secreto HMAC y de la tabla d
   template.hasOutput('TaskTokensTableArn', {
     Export: { Name: 'EnergyShark-TaskTokensTableArn' }
   });
+  template.hasOutput('Ec2SagaConsumerPolicyArn', {
+    Export: { Name: 'EnergyShark-Ec2SagaConsumerPolicyArn' }
+  });
+});
+
+test('declara ManagedPolicy con permisos minimos para la EC2 (sin wildcards ni secretos)', () => {
+  template.resourceCountIs('AWS::IAM::ManagedPolicy', 1);
+  template.hasResourceProperties('AWS::IAM::ManagedPolicy', {
+    ManagedPolicyName: 'EnergyShark-Ec2SagaConsumerPolicy'
+  });
+
+  const policies = template.findResources('AWS::IAM::ManagedPolicy');
+  const policyText = JSON.stringify(Object.values(policies)[0]);
+  expect(policyText).toContain('dynamodb:UpdateItem');
+  expect(policyText).toContain('dynamodb:GetItem');
+  expect(policyText).toContain('states:SendTaskSuccess');
+  expect(policyText).toContain('states:SendTaskFailure');
+  expect(policyText).toContain('EnergyShark-SellerSwapSaga');
+  expect(policyText).toContain('EnergyShark-BuyerSwapSaga');
+  expect(policyText).not.toContain('secretsmanager:');
+  expect(policyText).not.toContain('dynamodb:DeleteItem');
+  expect(policyText).not.toContain('"Resource":"*"');
 });
 
 test('declara la tabla DynamoDB de task tokens en modo PAY_PER_REQUEST con TTL', () => {

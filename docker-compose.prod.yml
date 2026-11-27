@@ -53,6 +53,8 @@ services:
       WALLET_BASE_URL: ${WALLET_BASE_URL:-}
       WALLET_API_KEY: ${WALLET_API_KEY:-}
       INTERNAL_SAGA_HMAC_SECRET: ${INTERNAL_SAGA_HMAC_SECRET:-}
+      AWS_REGION: ${AWS_REGION:-us-east-2}
+      TASK_TOKENS_TABLE_NAME: ${TASK_TOKENS_TABLE_NAME:-}
     depends_on:
       db:
         condition: service_healthy
