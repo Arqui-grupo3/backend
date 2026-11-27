@@ -22,6 +22,7 @@ const LAMBDAS_DIR = path.join(__dirname, '..', 'lambdas', 'seller');
 export class SagaStack extends Stack {
   readonly internalHmacSecret: secretsmanager.Secret;
   readonly taskTokensTable: dynamodb.Table;
+  readonly ec2SagaConsumerPolicy: iam.ManagedPolicy;
   readonly sellerStateMachine: sfn.StateMachine;
   readonly reservarFn: NodejsFunction;
   readonly proponerFn: NodejsFunction;
@@ -357,6 +358,30 @@ export class SagaStack extends Stack {
     this.proponerFn.addToRolePolicy(callbackPolicy);
     this.esperarCierreFn.addToRolePolicy(callbackPolicy);
 
+    // Politica IAM minima para el Instance Role de la EC2 (master reanuda sagas desde POST /events, tarea 2.1)
+    const buyerStateMachineArn = this.formatArn({
+      service: 'states',
+      resource: 'stateMachine',
+      resourceName: 'EnergyShark-BuyerSwapSaga',
+      arnFormat: ArnFormat.COLON_RESOURCE_NAME
+    });
+    this.ec2SagaConsumerPolicy = new iam.ManagedPolicy(this, 'Ec2SagaConsumerPolicy', {
+      managedPolicyName: 'EnergyShark-Ec2SagaConsumerPolicy',
+      description: 'Permisos minimos para que master en EC2 reanude sagas de Step Functions usando DynamoDB',
+      statements: [
+        new iam.PolicyStatement({
+          sid: 'TaskTokensTableAccess',
+          actions: ['dynamodb:UpdateItem', 'dynamodb:GetItem'],
+          resources: [this.taskTokensTable.tableArn]
+        }),
+        new iam.PolicyStatement({
+          sid: 'StepFunctionsTaskCallbacks',
+          actions: ['states:SendTaskSuccess', 'states:SendTaskFailure'],
+          resources: [stateMachineArn, buyerStateMachineArn]
+        })
+      ]
+    });
+
     new CfnOutput(this, 'SellerSagaStateMachineArn', {
       value: this.sellerStateMachine.stateMachineArn,
       exportName: 'EnergyShark-SellerSagaStateMachineArn'
@@ -375,6 +400,11 @@ export class SagaStack extends Stack {
     new CfnOutput(this, 'TaskTokensTableArn', {
       value: this.taskTokensTable.tableArn,
       exportName: 'EnergyShark-TaskTokensTableArn'
+    });
+
+    new CfnOutput(this, 'Ec2SagaConsumerPolicyArn', {
+      value: this.ec2SagaConsumerPolicy.managedPolicyArn,
+      exportName: 'EnergyShark-Ec2SagaConsumerPolicyArn'
     });
   }
 }
