@@ -1,5 +1,8 @@
 require('dotenv').config();
 require('newrelic');
+// Logs con cycleId, idpk y swapId del mensaje en curso (RNF01). Va antes que el resto.
+const log = require('./log');
+log.install({ component: 'master' });
 const express = require('express');
 const { createPublicKey, randomUUID, verify } = require('crypto');
 const { Pool } = require('pg');
@@ -47,6 +50,7 @@ app.use(express.json({
     req.rawBody = buf.toString('utf8');
   }
 }));
+app.use(log.middleware);
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');

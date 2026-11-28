@@ -1,5 +1,8 @@
 require('dotenv').config();
 const telemetry = require('./telemetry');
+// Logs con cycleId, idpk y swapId del mensaje en curso (RNF01).
+const log = require('./log');
+log.install({ component: 'connector' });
 const fs = require('node:fs');
 const amqp = require('amqplib');
 const http = require('node:http');
@@ -189,6 +192,7 @@ async function main() {
       let raw = '';
       for await (const chunk of req) raw += chunk;
       const body = JSON.parse(raw);
+      log.enter(log.fieldsFromMessage(body));
       const message = await publishMessage(body, body.routingKey);
       res.writeHead(201, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(message));
@@ -234,6 +238,7 @@ async function main() {
       let event;
       try {
         event = JSON.parse(raw);
+        log.enter(log.fieldsFromMessage(event));
       } catch (err) {
         console.error('[connector] No se pudo parsear el mensaje, se descarta:', err.message);
         info.attrs.reason = 'INVALID_JSON';
@@ -370,6 +375,7 @@ async function consumeMarket(connection) {
       let event;
       try {
         event = JSON.parse(raw);
+        log.enter(log.fieldsFromMessage(event));
       } catch (err) {
         info.attrs.reason = 'INVALID_JSON';
         return discardMessage(marketChannel, msg, {

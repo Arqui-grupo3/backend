@@ -11,6 +11,7 @@
 // - 401, 404, 422: rechazo definitivo; no se reintenta.
 // - Si se agotan los intentos sin respuesta definitiva, la operación queda
 //   'pending' y el worker la retoma más tarde. Nunca se da por fallida por tiempo.
+const log = require('../log');
 const { randomUUID } = require('node:crypto');
 
 let newrelic = null;
@@ -350,7 +351,8 @@ function createWalletClient({
       [new Date(now()), limit]
     );
     const done = [];
-    for (const row of result.rows) done.push(await execute(row.idpk));
+    // Fuera de una request: los logs del reintento llevan la llave de la operación.
+    for (const row of result.rows) done.push(await log.run({ swapIdpk: row.idpk }, () => execute(row.idpk)));
     return done;
   }
 
