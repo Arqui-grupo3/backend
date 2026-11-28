@@ -279,3 +279,95 @@ Para importarlo:
 6. **APM & Services → energyshark-connector** aparece con transacciones *Non-web*.
 7. `SELECT count(*) FROM QueueMessage FACET queue SINCE 1 hour ago` muestra las dos
    colas, y `SELECT latest(messages) FROM QueueDepth FACET queue` devuelve datos.
+
+## 10. Logs correlacionables
+
+Toda línea de log que `master` o el `connector` escriben mientras procesan un
+mensaje lleva el contexto de ese mensaje, sin pasarlo a mano en cada
+`console.log`. Lo hace `log.js` (uno en cada servicio). Al arrancar,
+`log.install()` reemplaza `console.log/info/warn/error`. El contexto viaja con
+`AsyncLocalStorage` por todo el procesamiento, también a través de los `await`, y
+dos mensajes procesados en paralelo no se mezclan.
+
+| Campo | De dónde sale |
+| --- | --- |
+| `cycleId` | `cycleId` del mensaje |
+| `idpk` | `idpk` del mensaje; en `/internal/sagas/:idpk`, el de la ruta |
+| `type` | tipo del mensaje (`bid`, `swap-proposed`, …) |
+| `swapId` | `data.swapId` |
+| `swapIdpk` | `Idempotency-Key` de nuestra operación en la wallet (`data.idpk` de los eventos `swap-*`) |
+| `offerId` | `data.offerId` |
+| `executionName` | nombre de la ejecución de Step Functions (callbacks de la saga) |
+| `msgId`, `cityId` | del mensaje |
+
+Dónde se pone el contexto:
+
+- `master`: un middleware de Express en cada request (`/events`, `/market`,
+  `/internal/sagas/...`), y los reintentos de la wallet (`retryPending`) con el
+  `swapIdpk` de cada operación.
+- `connector`: cada mensaje consumido de `city.REE.q` y `market.REE`, y cada
+  publicación por `/publish`.
+
+**En la salida de los contenedores** (`docker compose logs master`) la línea
+termina con el contexto:
+
+```
+[seller] swap-proposed handler error: ... | cycleId=c-1 idpk=evt-1 type=swap-proposed swapId=sw-1 swapIdpk=op-1
+```
+
+Las líneas que ya son JSON, como las de `sagas/resume.js`
+(`saga_resume_sent_success`, `saga_resume_token_expired`, …), siguen siendo JSON:
+el contexto se agrega adentro y los campos propios de la línea mandan. En esas
+líneas, `idpk` es la llave de la operación con la que se guardó el task token.
+
+**En New Relic**, con la license key configurada, cada línea también se envía a
+**Logs** con `newrelic.recordLogEvent`. Los campos van como atributos, más
+`level`, `component` (`master` o `connector`) y `scope` (la etiqueta entre
+corchetes, como `seller`). El log queda enlazado a la transacción APM en curso.
+El forwarding de logs del agente está activo por defecto. Si no aparecen logs,
+revisa que `NEW_RELIC_APPLICATION_LOGGING_FORWARDING_ENABLED` no esté en `false`.
+
+```sql
+SELECT timestamp, component, level, message FROM Log WHERE swapId = '<swapId>' SINCE 1 day ago
+SELECT timestamp, component, message FROM Log WHERE cycleId = '<cycleId>' AND level = 'ERROR' SINCE 1 day ago
+SELECT count(*) FROM Log WHERE level = 'ERROR' FACET scope SINCE 1 hour ago
+SELECT count(*) FROM Log WHERE component = 'master-saga-resumer' FACET event SINCE 1 day ago
+```
+
+### De un log a la saga
+
+1. Desde la alerta o el error, busca en **Logs** por `swapId` (o `cycleId`).
+2. El `idpk` del mensaje que inició la saga es el nombre de la ejecución. Se
+   confirma en la base:
+
+   ```sql
+   SELECT idpk, execution_name, role, status, reason, started_at, finished_at
+   FROM saga_runs WHERE swap_id = '<swapId>' OR swap_idpk = '<swapIdpk>';
+   ```
+
+3. En la consola de AWS, **Step Functions → máquina de la saga → Executions**,
+   busca por `execution_name`. Ahí está el historial de pasos y la compensación.
+
+Las Lambdas de la saga escriben JSON con los mismos nombres de campo (`cycleId`,
+`idpk`, `swapId`, `executionName`), así que la misma búsqueda las encuentra
+cuando sus logs llegan a New Relic.
+
+### Logs de las Lambdas en New Relic
+
+Los logs de las Lambdas quedan en CloudWatch. Para verlos en New Relic junto a
+los de la EC2, se suscribe cada log group (`/aws/lambda/<función>`) a la función
+de envío de logs de New Relic. Esa función se instala con la integración de AWS
+(paso hecho en la E3, stack de CloudFormation de New Relic):
+
+**CloudWatch → Log groups → `/aws/lambda/<función>` → Subscription filters →
+Create Lambda subscription filter**. Como destino, `NewRelicLogsLoggingLambda`
+(o el nombre que tenga en el stack). Deja el patrón vacío para enviar todo.
+
+Si el CDK define el filtro, este paso manual no hace falta.
+
+### Qué no lleva contexto todavía
+
+- El worker del comprador (`buyer/worker.js`), que corre por ciclo fuera de un
+  mensaje. Se agrega cuando se rehaga para la saga del comprador (2.3).
+- El temporizador de rebaja de precio del vendedor.
+- La Lambda `reservar` no incluye `executionName` en sus logs. Las demás sí.
